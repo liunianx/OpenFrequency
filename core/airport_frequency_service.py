@@ -304,6 +304,20 @@ class AirportFrequencyService:
                 best_distance = distance
         return best_ident
 
+    def get_airport_runways(self, airport_ident):
+        """Return every runway ident at an airport (both directions), e.g. ["02L","20R",...]."""
+        airport_ident = (airport_ident or "").strip().upper()
+        if not airport_ident:
+            return []
+        with self._lock:
+            runways = [dict(item) for item in self._runways_by_airport.get(airport_ident, [])]
+        seen = []
+        for runway in runways:
+            ident = (runway.get("ident") or "").strip().upper()
+            if ident and ident not in seen:
+                seen.append(ident)
+        return seen
+
     def get_preferred_runways(self, airport_ident, wind_dir=None, limit=2):
         airport_ident = (airport_ident or "").strip().upper()
         with self._lock:

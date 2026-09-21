@@ -8,6 +8,8 @@ from .immersion.workload_sim import WorkloadSimulator
 from .taxi_router import TaxiRouter
 from .instruction_extractor import InstructionExtractor
 from .quick_reply import QuickReplyEngine
+from .atc_session import (ATCSession, PHASE_LABEL_ZH, enforce_message,
+                           extract_clearance_values, extract_runway, role_from_text)
 from .china_airspace import is_in_china_airspace, nearest_metric_rvsm_level, metres_to_feet, feet_to_metres
 
 class LogicManager:
@@ -15,11 +17,15 @@ class LogicManager:
     The central coordinator. Does not own other modules.
     It subscribes to events on the EventBus and emits data to the UI via SocketIO.
     """
-    def __init__(self, config, socketio, airport_frequency_service=None, ground_service=None):
+    def __init__(self, config, socketio, airport_frequency_service=None, ground_service=None,
+                 atc_session=None):
         self.config = config
         self.socketio = socketio
         self.airport_frequency_service = airport_frequency_service
         self.ground_service = ground_service
+        # 联络顺序 + 跨管制员共享状态的唯一事实来源
+        self.atc_session = atc_session or ATCSession(config, airport_frequency_service)
+        self.atc_session.attach(shared_context)
         self.taxi_router = TaxiRouter(ground_service) if ground_service else None
         self.workload_sim = WorkloadSimulator(config)
         self.scheduler = None
@@ -300,6 +306,12 @@ class LogicManager:
             })
 
     def on_flight_plan_loaded(self, flight_plan):
+        self.atc_session.load_from_flight_plan(flight_plan or {})
+        self._emit_phase_update()
+        # 先落到 shared_context：_refresh_nearby_airports 的回退分支读的就是这份数据，
+        # 不写进去的话飞机没位置时联系不上机场频率库，频率反查会失败。
+        with context_lock:
+            shared_context['flight_plan'] = dict(flight_plan or {})
         self._refresh_nearby_airports(force=True)
         if flight_plan.get('destination', 'N/A') != 'N/A' or flight_plan.get('origin', 'N/A') != 'N/A':
             fp = dict(flight_plan)
@@ -534,6 +546,11 @@ class LogicManager:
             shared_context['atc_state']['current_frequency'] = normalized_freq
             current_controller = shared_context['atc_state']['current_controller']
             self.active_channel_key = channel_key
+            # 让 session 知道飞行员现在守听的是哪个角色，并按联络顺序推进阶段
+            tuned_phase = self.atc_session.observe_tuning(role)
+            shared_context['atc_state']['session'] = self.atc_session.state
+            if tuned_phase:
+                self._emit_phase_update()
 
         if duplicate_switch:
             self.last_freq = normalized_freq
@@ -783,6 +800,15 @@ class LogicManager:
             on_ground = ac_data.get('on_ground', True)
             current_controller = shared_context['atc_state'].get('current_controller', '')
 
+            # session 阶段推进是联络顺序的唯一事实来源
+            advanced_phase = self.atc_session.observe_telemetry(
+                on_ground=on_ground, altitude=alt, vs=vs,
+                groundspeed=ac_data.get('airspeed', 0))
+            if advanced_phase:
+                with context_lock:
+                    shared_context['atc_state']['session'] = self.atc_session.state
+                self._on_phase_advanced(advanced_phase, current_controller)
+
             # Detect ground→air transition: push flight plan with coords to dashboard
             if self._was_on_ground and not on_ground:
                 fp = dict(shared_context.get('flight_plan', {}))
@@ -844,6 +870,48 @@ class LogicManager:
                 self._current_fir = None  # 落地后重置 FIR，下次起飞重新检测
             
             self.last_vs = vs
+
+    # 阶段推进 → 主动移交（带确定性频率）
+    _PHASE_ADVANCE_REASON = {
+        'CLEARANCE':  'atis_copied_suggest_clearance_contact',
+        'GROUND_DEP': 'clearance_issued_suggest_ground_contact',
+        'TOWER_DEP':  'holding_short_suggest_tower_contact',
+        'DEPARTURE':  'pilot_climbing_after_takeoff_suggest_departure_handoff',
+        'CENTER':     'pilot_at_cruise_altitude_suggest_center_handoff',
+        'APPROACH':   'pilot_descending_suggest_approach_handoff',
+        'TOWER_ARR':  'on_final_suggest_tower_handoff',
+        'GROUND_ARR': 'landed_suggest_ground_handoff',
+    }
+
+    def _emit_phase_update(self):
+        """把联络顺序、当前阶段、下一联系人频率推给前端。"""
+        phase = self.atc_session.phase
+        self.socketio.emit('atc_phase_update', {
+            'phase': phase,
+            'phase_label': PHASE_LABEL_ZH.get(phase, phase),
+            'controller': self.atc_session.phase_role(),
+            'next_contact': self.atc_session.next_contact(),
+            'sequence': self.atc_session.sequence_for_ui(),
+            'issued': self.atc_session.issued_instructions(),
+        })
+
+    def _on_phase_advanced(self, phase, current_controller):
+        """阶段前进一步时，让当前管制员主动发出带频率的移交指令。"""
+        contact = self.atc_session.contact_for(phase)
+        if not contact or not contact.get('frequency'):
+            return
+        reason = self._PHASE_ADVANCE_REASON.get(phase)
+        if not reason:
+            return
+        flag_key = {'DEPARTURE': 'departure', 'CENTER': 'cruise', 'APPROACH': 'approach'}.get(phase)
+        if flag_key:
+            if self.handoff_triggered.get(flag_key):
+                return
+            self.handoff_triggered[flag_key] = True
+        self.atc_session.record_handoff(current_controller, contact['role'], contact['frequency'])
+        print(f"LogicManager: 阶段推进 → {phase}，主动移交 {contact['role']} {contact['frequency']}")
+        self._emit_phase_update()
+        event_bus.emit('proactive_atc_request', reason, shared_context)
 
     def on_atc_broadcast(self, message):
         """Handles ATC broadcasts from the immersion engine."""
@@ -918,11 +986,62 @@ class LogicManager:
         if self._plugin_manager:
             text = self._plugin_manager.hook_pilot_input(text) or text
 
+        # ── Tier 0: 确定性处理（联络顺序 / 频率查询 / 权威值），不经过 LLM ────
+        # 这些问题必须由代码保证答案，不能指望模型自觉：
+        #   · 频率是多少      → 查频率表回答
+        #   · 越权请求        → 重定向到正确的管制单位并带上频率
+        #   · 明确申请换跑道  → 先落到 session，后续 prompt 才会拿到新跑道
+        callsign = self._resolve_callsign(ctx_snapshot)
+        tuned_role = self._current_role_key()
+
+        answer = self.atc_session.answer_frequency_query(text, callsign)
+        if answer:
+            print(f"LogicManager: [Tier 0] 频率查询 → '{answer}'")
+            self.on_llm_response(answer, None)
+            return
+
+        check = self.atc_session.check_request(text, tuned_role)
+        if not check['allowed']:
+            redirect = check.get('redirect') or {}
+            role_zh = redirect.get('role_zh') or redirect.get('role') or '管制'
+            freq = redirect.get('frequency')
+            current_freq = ctx_snapshot['atc_state'].get('current_frequency')
+            same_freq = False
+            try:
+                same_freq = bool(freq) and abs(float(freq) - float(current_freq or 0)) < 0.005
+            except (TypeError, ValueError):
+                same_freq = False
+            if same_freq:
+                # 已经守听在目标频率上，再重定向只会变成死循环，交给 LLM 处理
+                print(f"LogicManager: [Tier 0] 越权请求 '{check['action']}' 但已在目标频率，交给 LLM")
+            else:
+                prefix = f"{callsign}，" if callsign else ""
+                if freq:
+                    reply = f"{prefix}请先联系{role_zh} {freq}，再见。"
+                else:
+                    reply = f"{prefix}请先联系{role_zh}，再见。"
+                print(f"LogicManager: [Tier 0] 越权请求 '{check['action']}'({check['reason']}) → {reply}")
+                self.on_llm_response(reply, None)
+                return
+
+        if check['action'] == 'runway_request':
+            requested = extract_runway(text)
+            if requested:
+                arrival = self.atc_session.state.get('descending') or \
+                    self.atc_session.phase in ('APPROACH', 'TOWER_ARR')
+                ok, display, reason = self.atc_session.propose_runway(
+                    requested, by=tuned_role or 'ATC', arrival=arrival,
+                    allow_change=self.atc_session.phase in ('GROUND_DEP', 'TOWER_DEP', 'APPROACH'))
+                print(f"LogicManager: [Tier 0] 跑道申请 {requested} → {display} ({reason})")
+
         # ── Tier 1: Keyword / template auto-match ───────────────────────────
         # Pure readbacks / roger / wilco → instant canned response, no AI.
+        # 带提问的消息不在这里处理，否则"地面频率是多少"会被"复诵正确"吞掉。
         stt_lang = self._config_audio_lang()
         qr_ctx = QuickReplyEngine.build_context_from_shared(ctx_snapshot)
-        quick = QuickReplyEngine.auto_match(text, current_controller, qr_ctx, lang=stt_lang)
+        quick = None
+        if not self._looks_like_question(text):
+            quick = QuickReplyEngine.auto_match(text, current_controller, qr_ctx, lang=stt_lang)
         if quick:
             print(f"LogicManager: [Tier 1] Template matched → '{quick[:60]}'")
             self.on_llm_response(quick, None)
@@ -993,6 +1112,38 @@ class LogicManager:
             print(f"LogicManager: Tier 2 fast LLM error — {e}; escalating.")
             return None
 
+    def _resolve_callsign(self, ctx_snapshot=None):
+        """取当前呼号；没配置过时退回 session 里的，再不行就不加前缀。"""
+        raw = ''
+        if ctx_snapshot:
+            raw = (ctx_snapshot.get('aircraft', {}) or {}).get('callsign', '') or ''
+        if not raw or str(raw).strip().upper() in ('N/A', 'NONE', ''):
+            raw = self.atc_session.get('callsign') or ''
+        raw = str(raw).strip()
+        return '' if raw.upper() in ('N/A', 'NONE', '') else raw
+
+    def _current_role_key(self):
+        """当前守听频率对应的管制角色键，例如 'Tower' / 'Clearance Delivery'。"""
+        with context_lock:
+            atc_state = shared_context.get('atc_state', {})
+            raw = (atc_state.get('current_frequency_role')
+                   or atc_state.get('current_controller', '') or '')
+        for key in ('Clearance Delivery', 'Ground', 'Tower', 'Departure',
+                    'Approach', 'Center', 'ATIS', 'Unicom', 'Emergency'):
+            if key in raw:
+                return key
+        return raw or None
+
+    @staticmethod
+    def _looks_like_question(text: str) -> bool:
+        """带提问的句子不能走纯复诵模板。"""
+        if not text:
+            return False
+        markers = ('？', '?', '多少', '什么', '哪', '吗', '嘛', '是否',
+                   'what', 'which', 'how', 'when', 'where', 'why')
+        lower = text.lower()
+        return any(marker in lower for marker in markers)
+
     def _config_audio_lang(self) -> str:
         """Return 'en'/'zh'/'ja' for quick-reply template selection."""
         lang = self.config.get('audio', {}).get('stt_language', 'en')
@@ -1026,6 +1177,13 @@ class LogicManager:
         # ── Plugin hook: allow plugins to modify ATC text ─────────────────
         if self._plugin_manager:
             text = self._plugin_manager.hook_atc_response(text, action) or text
+
+        # ── 权威值 + 移交频率兜底 ────────────────────────────────────────────
+        # 不管模型输出什么，跑道/应答机必须和 session 一致，移交句必须带频率。
+        guarded, guard_notes = enforce_message(text, self.atc_session)
+        if guarded != text:
+            print(f"LogicManager: [Guard] {guard_notes} — '{text}' → '{guarded}'")
+            text = guarded
 
         sender = self._get_current_sender_name()
         self._broadcast_chat(sender, text)
@@ -1065,6 +1223,9 @@ class LogicManager:
 
     def _emit_instruction_cards(self, text, sender):
         cards = InstructionExtractor.extract(text)
+        # 权威状态必须先落库：即使没识别出任何卡片，也要从原文里抓跑道/应答机/SID，
+        # 否则后一个管制员就看不到前面指定的值。
+        self._update_issued_instructions(cards, text, sender=sender)
         if not cards:
             return
         self.socketio.emit('instruction_cards_update', {
@@ -1072,7 +1233,6 @@ class LogicManager:
             'cards': cards,
             'source_text': text,
         })
-        self._update_issued_instructions(cards, text)
 
         # ── Radar vector mode: apply AP commands to simulator ─────────────
         if self.radar_vector_mode and self._sim_bridge:
@@ -1127,31 +1287,45 @@ class LogicManager:
         'TAXI':  'taxi_route',
     }
 
-    def _update_issued_instructions(self, cards, raw_text):
-        """Update shared_context issued_instructions from freshly extracted cards."""
+    def _update_issued_instructions(self, cards, raw_text, sender=None):
+        """
+        把刚下达的指令写进 session。
+        session 决定哪些字段能被改写：应答机/跑道/SID/巡航高度 first-write-wins，
+        高度/航向/速度/海压等后者覆盖前者。
+        """
         import re
-        updates = {}
-        for card in cards:
-            key = self._CARD_TO_ISSUED.get(card['type'])
-            if key:
-                updates[key] = card['value']
+        by = sender or 'ATC'
+        phase = self.atc_session.phase
+        arrival = self.atc_session.state.get('descending') or phase in ('APPROACH', 'TOWER_ARR')
 
-        # Also try to detect departure runway / SID from clearance text
-        raw_lower = raw_text.lower()
-        rwy_m = re.search(r'\brunway\s+(\d{1,2}[lrc]?)\b', raw_lower)
-        if rwy_m:
-            updates['departure_runway'] = rwy_m.group(1).upper()
+        # 跑道单独走校验：必须是该机场真实存在的跑道，且不会被悄悄改掉
+        requested = extract_runway(raw_text or '')
+        if requested:
+            ok, display, reason = self.atc_session.propose_runway(
+                requested, by=by, arrival=arrival,
+                allow_change=phase in ('GROUND_DEP', 'TOWER_DEP', 'APPROACH'))
+            if not ok and reason == 'already_assigned':
+                print(f"LogicManager: 跑道 {requested} 已被指定，忽略本次改动")
 
-        sid_m = re.search(r'\bvia\s+([A-Z]{2,6}\d[A-Z]?)\b', raw_text, re.IGNORECASE)
+        # SID / 巡航高度从放行稿里再兜一次
+        raw_lower = (raw_text or '').lower()
+        sid_m = re.search(r'\bvia\s+([A-Z]{2,6}\d[A-Z]?)\b', raw_text or '', re.IGNORECASE)
         if sid_m:
-            updates['sid'] = sid_m.group(1).upper()
+            self.atc_session.assign('sid', sid_m.group(1).upper(), by=by)
 
-        if not updates:
-            return
+        # 先从原文直抽（中文"应答机4231""经VIBOS2离场"卡片识别不到）
+        for field, value in extract_clearance_values(raw_text or '').items():
+            self.atc_session.assign(field, value, by=by)
+
+        for card in cards or []:
+            key = self._CARD_TO_ISSUED.get(card['type'])
+            if not key:
+                continue
+            self.atc_session.assign(key, card['value'], by=by)
+
         with context_lock:
             issued = shared_context['atc_state'].setdefault('issued_instructions', {})
-            issued.update(updates)
-            # Keep last_instruction in sync for legacy consumers
+            issued.update(self.atc_session.issued_instructions())
             shared_context['atc_state']['last_instruction'] = raw_text
 
     def on_sim_status(self, data):

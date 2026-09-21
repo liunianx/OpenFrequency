@@ -1804,8 +1804,16 @@ if __name__ == '__main__':
     from core.head_tracker import HeadTracker
     from core.emergency_director import EmergencyDirector
     
-    logic_manager = LogicManager(config, socketio, airport_frequency_service=airport_frequency_service, ground_service=ground_data_service)
-    atc_monitor = ATCMonitor(config)
+    # ── ATC 联络顺序 / 跨管制员共享状态（唯一事实来源） ───────────────────────
+    # LogicManager、ATCHandoffManager、ATCMonitor、LLM prompt 共用同一个实例，
+    # 保证跑道/应答机/频率在所有管制员之间一致。
+    from core.atc_session import ATCSession
+    atc_session = ATCSession(config, airport_frequency_service)
+    atc_session.attach(shared_context)
+
+    logic_manager = LogicManager(config, socketio, airport_frequency_service=airport_frequency_service,
+                                 ground_service=ground_data_service, atc_session=atc_session)
+    atc_monitor = ATCMonitor(config, atc_session=atc_session)
     sim_bridge = SimBridge(config, shared_context, context_lock, event_bus)
 
     # ── Cabin Media Manager ───────────────────────────────────────────────────
@@ -1851,7 +1859,8 @@ if __name__ == '__main__':
     
     # --- ATC Handoff State Machine ---
     from core.atc_handoff import ATCHandoffManager
-    atc_handoff = ATCHandoffManager(config, socketio)
+    atc_handoff = ATCHandoffManager(config, socketio, session=atc_session,
+                                    airport_frequency_service=airport_frequency_service)
     event_bus.emit('flight_plan_loaded', shared_context.get('flight_plan', {}))
 
     @socketio.on('set_flight_mode')

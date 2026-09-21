@@ -171,6 +171,15 @@
                         <strong data-i18n="nearby_airports_title">Nearby Airports & Frequencies</strong>
                         <span id="active-frequency-badge" class="badge bg-primary">No Active Channel</span>
                     </div>
+                    <div id="atc-sequence-panel" class="card shadow-sm mb-3 d-none">
+                        <div class="card-body py-2 px-3">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <strong style="font-size:0.85rem;" data-i18n="contact_sequence_title">联络顺序 / Contact Sequence</strong>
+                                <button id="btn-tune-next" class="btn btn-sm btn-primary d-none" type="button"></button>
+                            </div>
+                            <div id="atc-sequence-strip" class="d-flex flex-wrap gap-1"></div>
+                        </div>
+                    </div>
                     <div class="mb-3">
                         <button id="btn-refresh-airport-data" class="btn btn-sm btn-outline-secondary" type="button" data-i18n="refresh_airport_data">Refresh Airport Data</button>
                     </div>
@@ -915,6 +924,52 @@
 
     socket.on('nearby_frequencies_update', (data) => {
         loadNearbyFrequencies();
+    });
+
+    // ── 联络顺序条：当前该联系谁、下一个联系人及频率 ──────────────────────
+    function renderContactSequence(sequence, nextContact) {
+        const panel = document.getElementById('atc-sequence-panel');
+        const strip = document.getElementById('atc-sequence-strip');
+        const tuneBtn = document.getElementById('btn-tune-next');
+        if (!panel || !strip) return;
+        if (!sequence || !sequence.length) { panel.classList.add('d-none'); return; }
+        panel.classList.remove('d-none');
+
+        strip.innerHTML = sequence.map(step => {
+            const freq = step.frequency ? Number(step.frequency).toFixed(3) : '—';
+            let cls = 'btn-outline-secondary';
+            let marker = '';
+            if (step.state === 'current') { cls = 'btn-primary'; marker = '▶ '; }
+            else if (step.state === 'done') { cls = 'btn-success'; marker = '✓ '; }
+            const zh = (localStorage.getItem('language') || 'en') === 'zh';
+            const label = zh ? (step.label_zh || step.label_en) : (step.label_en || step.label_zh);
+            return `<button type="button" class="btn btn-sm ${cls} seq-step" data-freq="${freq}"
+                        title="${label} ${freq}" ${step.frequency ? '' : 'disabled'}>${marker}${label} ${freq}</button>`;
+        }).join('');
+
+        strip.querySelectorAll('.seq-step').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const f = parseFloat(btn.getAttribute('data-freq'));
+                if (!isNaN(f)) socket.emit('tune_frequency', { frequency: f });
+            });
+        });
+
+        if (tuneBtn) {
+            if (nextContact && nextContact.frequency) {
+                tuneBtn.classList.remove('d-none');
+                const zh = (localStorage.getItem('language') || 'en') === 'zh';
+                const role = zh ? (nextContact.role_zh || nextContact.role) : nextContact.role;
+                const verb = i18nText('contact_next', zh ? '联系' : 'Contact');
+                tuneBtn.textContent = `${verb}${role} ${Number(nextContact.frequency).toFixed(3)}`;
+                tuneBtn.onclick = () => socket.emit('tune_frequency', { frequency: Number(nextContact.frequency) });
+            } else {
+                tuneBtn.classList.add('d-none');
+            }
+        }
+    }
+
+    socket.on('atc_phase_update', (data) => {
+        renderContactSequence(data.sequence, data.next_contact);
     });
 
     socket.on('radio_context_changed', (data) => {

@@ -4,258 +4,196 @@ ATC Handoff State Machine
 
 移交顺序:
 ATIS抄收 → 放行 → 地面/机坪 → 塔台起飞 → 离场 → 中心 → 进场 → 塔台降落 → 地面/机坪
+
+本模块现在只是 core.atc_session.ATCSession 的适配层：真正的阶段梯、
+权威指令（跑道/应答机/SID/高度）、下一联系人频率都由 ATCSession 统一持有，
+这里保留原有的事件接口与对外 API，方便 app.py 与前端继续使用。
 """
-import threading
-from enum import Enum, auto
-from .context import shared_context, context_lock, event_bus
+from enum import Enum
+
+from .atc_session import (
+    ATCSession,
+    PHASES,
+    PHASE_ROLE,
+    PHASE_LABEL_EN,
+    PHASE_LABEL_ZH,
+)
+from .context import shared_context, event_bus
+
 
 class ATCPhase(Enum):
-    """ATC 阶段枚举"""
-    ATIS = auto()         # 抄收 ATIS
-    CLEARANCE = auto()    # 放行
-    GROUND_DEP = auto()   # 地面/机坪 (出发)
-    TOWER_DEP = auto()    # 塔台 (起飞)
-    DEPARTURE = auto()    # 离场
-    CENTER = auto()       # 中心/区调
-    APPROACH = auto()     # 进场
-    TOWER_ARR = auto()    # 塔台 (降落)
-    GROUND_ARR = auto()   # 地面/机坪 (到达)
-    PARKED = auto()       # 完成停机
+    """ATC 阶段枚举（与 ATCSession.PHASES 保持一致）"""
+    ATIS = "ATIS"               # 抄收 ATIS
+    CLEARANCE = "CLEARANCE"     # 放行
+    GROUND_DEP = "GROUND_DEP"   # 地面/机坪 (出发)
+    TOWER_DEP = "TOWER_DEP"     # 塔台 (起飞)
+    DEPARTURE = "DEPARTURE"     # 离场
+    CENTER = "CENTER"           # 中心/区调
+    APPROACH = "APPROACH"       # 进场
+    TOWER_ARR = "TOWER_ARR"     # 塔台 (降落)
+    GROUND_ARR = "GROUND_ARR"   # 地面/机坪 (到达)
+    PARKED = "PARKED"           # 完成停机
+
 
 class ATCHandoffManager:
     """
-    ATC 移交状态机管理器
+    ATC 移交状态机管理器（ATCSession 适配层）
     - 自动检测当前飞行阶段
     - 强制移交到正确的管制单位
     - 自动触发 ATIS 抄收
+    - 所有跨管制员共享状态由 ATCSession 持有
     """
-    
-    # 每个阶段对应的管制频率范围 (MHz)
-    # 注意：这些范围必须不重叠，以避免频率分配错误
-    FREQ_RANGES = {
-        ATCPhase.ATIS: (126.0, 128.0),
-        ATCPhase.CLEARANCE: (121.0, 121.5),
-        ATCPhase.GROUND_DEP: (121.5, 122.0),
-        ATCPhase.TOWER_DEP: (118.0, 120.0),
-        ATCPhase.DEPARTURE: (124.0, 125.0),  # 修正：缩小范围避免与Ground重叠
-        ATCPhase.CENTER: (128.0, 136.0),
-        ATCPhase.APPROACH: (125.0, 126.0),  # 修正：调整范围
-        ATCPhase.TOWER_ARR: (118.0, 120.0),
-        ATCPhase.GROUND_ARR: (121.5, 122.0),
-    }
-    
-    # 阶段转换条件
-    TRANSITION_CONDITIONS = {
-        ATCPhase.ATIS: {'next': ATCPhase.CLEARANCE, 'condition': 'atis_copied'},
-        ATCPhase.CLEARANCE: {'next': ATCPhase.GROUND_DEP, 'condition': 'clearance_received'},
-        ATCPhase.GROUND_DEP: {'next': ATCPhase.TOWER_DEP, 'condition': 'holding_short'},
-        ATCPhase.TOWER_DEP: {'next': ATCPhase.DEPARTURE, 'condition': 'airborne'},
-        ATCPhase.DEPARTURE: {'next': ATCPhase.CENTER, 'condition': 'cruise_altitude'},
-        ATCPhase.CENTER: {'next': ATCPhase.APPROACH, 'condition': 'descending'},
-        ATCPhase.APPROACH: {'next': ATCPhase.TOWER_ARR, 'condition': 'final_approach'},
-        ATCPhase.TOWER_ARR: {'next': ATCPhase.GROUND_ARR, 'condition': 'landed'},
-        ATCPhase.GROUND_ARR: {'next': ATCPhase.PARKED, 'condition': 'parked'},
-    }
-    
-    def __init__(self, config, socketio):
+
+    def __init__(self, config, socketio, session=None, airport_frequency_service=None):
         self.config = config
         self.socketio = socketio
+        self.session = session or ATCSession(config, airport_frequency_service)
+        self.session.attach(shared_context)
         self.current_phase = ATCPhase.ATIS
         self.atis_copied = False
         self.clearance_received = False
         self.last_phase = None
-        
-        # 航班特定数据
+
+        # 航班特定数据（镜像自 session，便于旧代码读取）
         self.origin_icao = None
         self.dest_icao = None
         self.cruise_altitude = 0
-        
+
         # 订阅事件
         event_bus.on('telemetry_update', self.on_telemetry)
         event_bus.on('flight_plan_loaded', self.on_flight_plan)
         event_bus.on('atis_played', self.on_atis_played)
         event_bus.on('clearance_confirmed', self.on_clearance_confirmed)
         event_bus.on('handoff_complete', self.on_handoff_complete)
-        
-        print("ATCHandoffManager: Initialized")
-    
+
+        print("ATCHandoffManager: Initialized (ATCSession adapter)")
+
+    # ── 事件处理 ────────────────────────────────────────────────────────────
+
     def on_flight_plan(self, flight_plan):
         """航班计划加载时初始化"""
-        self.origin_icao = flight_plan.get('origin')
-        self.dest_icao = flight_plan.get('destination')
-        self.cruise_altitude = int(flight_plan.get('cruise_alt', 0))
-        
+        self.session.load_from_flight_plan(flight_plan or {})
+        self._sync_mirror()
+        self.origin_icao = self.session.state.get('origin')
+        self.dest_icao = self.session.state.get('destination')
+        self.cruise_altitude = self.session.state.get('cruise_alt', 0)
+
         # 自动请求 ATIS
         if self.origin_icao:
             print(f"ATCHandoffManager: 自动获取 {self.origin_icao} ATIS...")
             self._request_atis(self.origin_icao)
             self._broadcast_phase_change()
-    
+
     def on_telemetry(self, data):
-        """根据遥测数据检测阶段转换"""
-        alt = data.get('altitude', 0)
-        gs = data.get('groundspeed', 0)
-        vs = data.get('vs', 0)
-        on_ground = data.get('on_ground', True)
-        
-        old_phase = self.current_phase
-        
-        # 阶段自动检测
-        if self.current_phase == ATCPhase.ATIS:
-            # 等待 ATIS 被抄收
-            if self.atis_copied:
-                self._transition_to(ATCPhase.CLEARANCE)
-        
-        elif self.current_phase == ATCPhase.CLEARANCE:
-            if self.clearance_received:
-                self._transition_to(ATCPhase.GROUND_DEP)
-        
-        elif self.current_phase == ATCPhase.GROUND_DEP:
-            # 如果正在滑行且速度 > 5 且在地面
-            if on_ground and gs > 5:
-                # 检测是否在跑道等待
-                pass  # 需要更多逻辑来检测 holding short
-        
-        elif self.current_phase == ATCPhase.TOWER_DEP:
-            # 离地后移交离场
-            if not on_ground and alt > 500:
-                self._transition_to(ATCPhase.DEPARTURE)
-        
-        elif self.current_phase == ATCPhase.DEPARTURE:
-            # 到达巡航高度移交中心
-            if alt > 18000 and abs(vs) < 500:
-                self._transition_to(ATCPhase.CENTER)
-        
-        elif self.current_phase == ATCPhase.CENTER:
-            # 开始下降移交进场
-            if vs < -300 and alt < self.cruise_altitude * 0.8:
-                self._transition_to(ATCPhase.APPROACH)
-        
-        elif self.current_phase == ATCPhase.APPROACH:
-            # 进入五边移交塔台
-            if alt < 3000 and not on_ground:
-                self._transition_to(ATCPhase.TOWER_ARR)
-        
-        elif self.current_phase == ATCPhase.TOWER_ARR:
-            # 落地后移交地面
-            if on_ground and gs < 80:
-                self._transition_to(ATCPhase.GROUND_ARR)
-        
-        elif self.current_phase == ATCPhase.GROUND_ARR:
-            # 停机
-            if on_ground and gs < 1:
-                self._transition_to(ATCPhase.PARKED)
-        
-        # 广播阶段变化
-        if old_phase != self.current_phase:
+        """根据遥测数据检测阶段转换（实际逻辑在 ATCSession）"""
+        advanced = self.session.observe_telemetry(
+            on_ground=data.get('on_ground'),
+            altitude=data.get('altitude'),
+            vs=data.get('vs'),
+            groundspeed=data.get('groundspeed'),
+        )
+        if advanced:
+            self._sync_mirror()
             self._broadcast_phase_change()
-    
+
+    def _sync_mirror(self):
+        phase = self.session.phase
+        try:
+            self.current_phase = ATCPhase(phase)
+        except ValueError:
+            self.current_phase = ATCPhase.ATIS
+
     def _transition_to(self, new_phase):
         """执行阶段转换"""
-        old_phase = self.current_phase
-        self.current_phase = new_phase
-        
-        phase_names = {
-            ATCPhase.ATIS: "ATIS",
-            ATCPhase.CLEARANCE: "Clearance Delivery",
-            ATCPhase.GROUND_DEP: "Ground",
-            ATCPhase.TOWER_DEP: "Tower",
-            ATCPhase.DEPARTURE: "Departure",
-            ATCPhase.CENTER: "Center",
-            ATCPhase.APPROACH: "Approach",
-            ATCPhase.TOWER_ARR: "Tower",
-            ATCPhase.GROUND_ARR: "Ground",
-            ATCPhase.PARKED: "Parked"
-        }
-        
-        print(f"ATCHandoffManager: 阶段转换 {phase_names[old_phase]} → {phase_names[new_phase]}")
-        
+        if isinstance(new_phase, ATCPhase):
+            new_phase = new_phase.value
+        self.last_phase = self.current_phase
+        if not self.session.advance_to(new_phase):
+            return
+        self._sync_mirror()
+        phase_names = PHASE_LABEL_EN
+        print(f"ATCHandoffManager: 阶段转换 → {phase_names.get(new_phase, new_phase)}")
+
         # 触发主动移交事件
         event_bus.emit('mandatory_handoff', {
-            'from_phase': old_phase.name,
-            'to_phase': new_phase.name,
-            'controller': phase_names[new_phase]
+            'from_phase': self.last_phase.name if self.last_phase else None,
+            'to_phase': new_phase,
+            'controller': phase_names.get(new_phase),
+            'next_contact': self.session.next_contact(),
         })
-        
+
         # 如果是进场阶段，自动获取目的地 ATIS
-        if new_phase == ATCPhase.APPROACH and self.dest_icao:
+        if new_phase == 'APPROACH' and self.dest_icao:
             print(f"ATCHandoffManager: 自动获取 {self.dest_icao} ATIS...")
             self._request_atis(self.dest_icao)
-    
+
     def _request_atis(self, icao):
         """请求 ATIS 广播"""
         event_bus.emit('atis_playback_request', icao)
-    
+
     def _broadcast_phase_change(self):
         """广播当前阶段到前端"""
+        phase = self.session.phase
         self.socketio.emit('atc_phase_update', {
-            'phase': self.current_phase.name,
+            'phase': phase,
+            'phase_label': PHASE_LABEL_ZH.get(phase, phase),
+            'controller': self.session.phase_role(),
+            'next_contact': self.session.next_contact(),
+            'sequence': self.session.sequence_for_ui(),
             'origin': self.origin_icao,
-            'destination': self.dest_icao
+            'destination': self.dest_icao,
         })
-    
+
     def on_atis_played(self, icao):
         """ATIS 播放完成"""
+        self.session.mark_atis_copied()
         self.atis_copied = True
         print(f"ATCHandoffManager: ATIS {icao} 已抄收")
-    
+
     def on_clearance_confirmed(self):
         """放行确认"""
+        self.session.mark_atis_copied()
         self.clearance_received = True
         print("ATCHandoffManager: 放行已确认")
-    
+
     def on_handoff_complete(self, data):
         """处理手动移交完成"""
         target_phase = data.get('phase')
         if target_phase:
-            try:
-                new_phase = ATCPhase[target_phase]
-                self._transition_to(new_phase)
-            except KeyError:
-                print(f"ATCHandoffManager: Unknown phase {target_phase}")
-    
+            self._transition_to(target_phase)
+
     def reset(self):
         """重置状态（新航班）"""
-        self.current_phase = ATCPhase.ATIS
+        self.session.reset()
         self.atis_copied = False
         self.clearance_received = False
         self.origin_icao = None
         self.dest_icao = None
         self.cruise_altitude = 0
+        self._sync_mirror()
         print("ATCHandoffManager: 状态已重置")
-    
+
+    # ── 查询接口 ────────────────────────────────────────────────────────────
+
     def get_current_controller(self):
         """获取当前应该联系的管制单位"""
-        short_names = {
-            'ZSAM': 'Gaoqi', 'ZBAA': 'Capital', 'ZBAD': 'Daxing',
-            'ZSPD': 'Pudong', 'ZSSS': 'Hongqiao', 'ZSHC': 'Xiaoshan',
-        }
-        origin = short_names.get((self.origin_icao or '').upper(), self.origin_icao or 'Airport')
-        dest = short_names.get((self.dest_icao or '').upper(), self.dest_icao or 'Airport')
-        controller_map = {
-            ATCPhase.ATIS: "ATIS",
-            ATCPhase.CLEARANCE: "Clearance Delivery",
-            ATCPhase.GROUND_DEP: f"{origin} Ground",
-            ATCPhase.TOWER_DEP: f"{origin} Tower",
-            ATCPhase.DEPARTURE: "Departure Control",
-            ATCPhase.CENTER: "Center Control",
-            ATCPhase.APPROACH: f"{dest} Approach",
-            ATCPhase.TOWER_ARR: f"{dest} Tower",
-            ATCPhase.GROUND_ARR: f"{dest} Ground",
-            ATCPhase.PARKED: "Parked"
-        }
-        return controller_map.get(self.current_phase, "Unknown")
-    
+        return self.session.phase_role()
+
+    def get_current_phase(self):
+        return self.session.phase
+
     def get_suggested_frequency(self):
         """获取当前阶段建议的频率"""
-        freq_range = self.FREQ_RANGES.get(self.current_phase)
-        if freq_range:
-            # 返回范围中点作为建议
-            return (freq_range[0] + freq_range[1]) / 2
+        contact = self.session.contact_for(self.session.phase)
+        if contact and contact.get('frequency'):
+            return float(contact['frequency'])
         return 121.5  # 默认紧急
+
+    def get_next_contact(self):
+        return self.session.next_contact()
 
     def manual_advance(self):
         """手动推进到下一阶段（调试用）"""
-        transition = self.TRANSITION_CONDITIONS.get(self.current_phase)
-        if transition:
-            self._transition_to(transition['next'])
+        nxt = self.session.next_phase()
+        if nxt:
+            self._transition_to(nxt)

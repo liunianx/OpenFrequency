@@ -5,24 +5,26 @@ from google.genai import types
 import openai
 
 from core.china_airspace import is_in_china_airspace, build_china_rvsm_prompt_block
+from core.atc_session import (ATCSession, PHASE_LABEL_ZH, PHASE_ROLE, ROLE_FREQ_FALLBACKS,
+                           squawk_for_callsign)
 from core.cpdlc_manager import cpdlc_manager
 
 class LLMClient:
     ROLE_RULES = {
         "Ground": {
-            "duties": "Clearance Delivery, Pushback, Taxi instructions. State QNH once in initial clearance only.",
-            "taboos": "Do NOT give Takeoff/Landing clearances. Do NOT vector aircraft in air. Do NOT repeat QNH in every readback response — say it once."
+            "duties": "Pushback and engine start, taxi instructions, hold-short and runway-crossing clearances. State QNH once with the initial taxi clearance.",
+            "taboos": "Do NOT issue IFR clearance, squawk codes, SIDs or cruise altitude — that is Clearance Delivery's job. Do NOT give Takeoff/Landing clearances. Do NOT vector aircraft in the air. Do NOT repeat QNH in every readback response — say it once."
         },
         "Tower": {
-            "duties": "Takeoff/Landing clearances, Runway crossing, Pattern entry. Issue initial climb only up to pattern altitude (≤3000 ft). Handoff to Departure after takeoff.",
-            "taboos": "Do NOT assign cruise/enroute altitudes above 3000 ft. Do NOT give ATIS information or QNH to departing aircraft. When issuing a handoff, ONLY say 'contact [facility] on [freq], good day' — nothing else."
+            "duties": "Takeoff/Landing clearances, runway entry and crossing, pattern entry, initial climb up to pattern altitude (≤3000 ft). Handoff to Departure after takeoff.",
+            "taboos": "Do NOT issue IFR clearance, squawk codes or SIDs — if the aircraft has no clearance yet, tell the pilot to contact Clearance Delivery. Do NOT assign cruise/enroute altitudes above 3000 ft. Do NOT give ATIS information or QNH to departing aircraft. When issuing a handoff, ONLY say 'contact [facility] on [freq], good day' — nothing else."
         },
         "Clearance Delivery": {
-            "duties": "IFR clearance delivery, squawk assignment, departure clearance confirmation.",
-            "taboos": "Do NOT issue takeoff or landing clearance. Do NOT provide radar vectors after departure."
+            "duties": "IFR clearance delivery — this is the FIRST contact of every departure. Issue destination, SID, departure runway, squawk, cruise altitude and QNH in one clearance, then hand the aircraft to Ground.",
+            "taboos": "Do NOT issue takeoff or landing clearance. Do NOT give taxi instructions or radar vectors. Do NOT re-issue a squawk or runway that is already in AUTHORITATIVE FLIGHT STATE."
         },
         "Approach/Departure": {
-            "duties": "Radar vectors, Altitude assignments, ILS/Visual approach clearance.",
+            "duties": "Radar vectors, altitude assignments, ILS/Visual approach clearance. When handing off, ALWAYS include the frequency.",
             "taboos": "Do NOT give ground taxi instructions. Do NOT clear for takeoff/landing (handoff to Tower)."
         },
         "Approach": {
@@ -199,6 +201,22 @@ class LLMClient:
         else:
             pro_lang = "Reply in ENGLISH only. Use standard ICAO phraseology."
 
+        # 主动移交：把 session 推导出的下一联系人+频率写死进 prompt
+        handoff_extra = ""
+        session_state = context_snapshot.get('atc_state', {}).get('session') or {}
+        if isinstance(session_state, dict) and session_state.get('phase'):
+            _session = ATCSession(self.config, self.airport_frequency_service)
+            _session.adopt(session_state)
+            _contact = _session.contact_for(session_state.get('phase'))
+            if _contact and _contact.get('frequency'):
+                handoff_extra = (
+                    f"\n        HANDOFF DETAILS (mandatory):"
+                    f"\n        - The aircraft must now be handed to {_contact['role']} on {_contact['frequency']}."
+                    f"\n        - Your transmission MUST end with: \"{callsign}, contact {_contact['role']} "
+                    f"on {_contact['frequency']}, good day.\""
+                    f"\n        - Do NOT invent any other frequency and do NOT add other instructions."
+                )
+
         system_prompt = f"""
         You are {role}. The pilot ({callsign}) has triggered a system alert: "{reason}".
         LANGUAGE: {pro_lang}
@@ -206,7 +224,7 @@ class LLMClient:
         Current Telemetry:
         - Alt: {alt} ft  |  VS: {vs} fpm  |  Flight phase: {flight_phase}
         - Hdg: {ac.get('heading', 'N/A')}
-        {fir_extra}
+        {fir_extra}{handoff_extra}
         CRITICAL RULES:
         1. You are INITIATING contact. Do not wait for a reply.
         2. Keep it brief and authoritative — one radio call only.
@@ -340,6 +358,18 @@ class LLMClient:
         else:
             issued_text = ""
         
+        # ── ATCSession：联络顺序 / 当前权限 / 权威指令 ────────────────────────
+        # 这三块由 session 统一生成，保证每个管制员看到的顺序、权限和历史指令一致。
+        session_state = context_copy.get('atc_state', {}).get('session') or {}
+        session = ATCSession(self.config, self.airport_frequency_service)
+        session.adopt(session_state)
+        sequence_text = session.sequence_block()
+        authority_text = session.authority_block()
+        if not issued_lines:
+            # session 里已经有权威值时，用 session 版本（更严格）
+            session_state_block = session.state_block()
+            issued_text = session_state_block or issued_text
+
         # Flight Plan Info (condensed - only show essentials, not full route)
         fp = context_copy.get('flight_plan', {})
         fp_text = ""
@@ -412,6 +442,17 @@ class LLMClient:
         dest = context_copy.get('flight_plan', {}).get('destination', '')
         if dest and dest != current_airport and len(freq_db) < 4:
             _load_airport_freqs(dest, freq_db)
+
+        # 角色回退：很多机场数据里没有独立的离场频率，此时用进近（现实中两者常共用）
+        for role, chain in ROLE_FREQ_FALLBACKS.items():
+            if role in freq_db:
+                continue
+            for candidate in chain:
+                value = freq_db.get(candidate)
+                if value:
+                    freq_db[role] = value
+                    print(f"LLMClient: {role} frequency derived from {candidate} → {value}")
+                    break
 
         def _f(role):
             return freq_db[role] if role in freq_db else "UNKNOWN"
@@ -649,6 +690,10 @@ class LLMClient:
         {emergency_help}
 
         {ground_help}
+
+        {sequence_text}
+
+        {authority_text}
 
         {issued_text}
 

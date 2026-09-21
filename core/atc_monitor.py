@@ -13,8 +13,9 @@ from .context import event_bus
 
 
 class ATCMonitor:
-    def __init__(self, config):
+    def __init__(self, config, atc_session=None):
         self.config = config
+        self.atc_session = atc_session
         monitor_config = config.get("atc_monitor", {}) or {}
         self.enabled = monitor_config.get("enabled", True)
         self.check_interval = float(monitor_config.get("check_interval_sec", 8))
@@ -106,10 +107,32 @@ class ATCMonitor:
         if "contact " in lower and parsed["handoff_frequency"]:
             self.instructions["handoff_frequency"] = parsed["handoff_frequency"]
 
+        # 移交句里没带频率时，用 session 推导的权威频率补上，
+        # 否则"handoff_not_completed"会因为拿不到频率而失效。
+        if ("contact " in lower or "联系" in text) and not parsed["handoff_frequency"]:
+            derived = self._session_handoff_frequency(text)
+            if derived:
+                self.instructions["handoff_frequency"] = derived
+
         # If "radar contact" was said by ATC, mark this frequency as having received it
         if "radar contact" in lower:
             freq = parsed.get("handoff_frequency") or self._last_known_freq
             self._radar_contact_given_freq = freq
+
+    def _session_handoff_frequency(self, text):
+        """从 ATCSession 推导这句话提到的角色的频率。"""
+        if not self.atc_session:
+            return None
+        try:
+            from .atc_session import role_from_text
+            role = role_from_text(text)
+            if not role:
+                contact = self.atc_session.next_contact()
+                return float(contact["frequency"]) if contact and contact.get("frequency") else None
+            freq = self.atc_session.frequency_for(role)
+            return float(freq) if freq else None
+        except Exception:
+            return None
 
     def on_telemetry_update(self, context_snapshot):
         if not self.enabled:

@@ -31,6 +31,9 @@ shared_context = {
         "current_frequency_label": "",
         "current_frequency_role": "",
         "current_channel_key": "",
+        # ATCSession state (contact sequence + cross-controller shared values).
+        # Single source of truth — see core/atc_session.py
+        "session": {},
         # Issued instructions that persist across frequency changes so every
         # controller always knows what has already been assigned to this aircraft.
         "issued_instructions": {
