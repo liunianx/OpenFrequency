@@ -88,3 +88,6 @@ Thumbs.db
 .venv_build/
 node_modules
 .playwright-mcp/
+
+# test artifact (LogicManager writes log_file="NUL" on Linux)
+NUL
