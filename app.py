@@ -33,6 +33,12 @@ from core.career import CareerProfile  # Career Mode
 from core.crew_manager import CrewManager  # Crew Manager (FO + Purser)
 from core.plugin_manager import PluginManager
 _plugin_manager = None  # set during startup; guards against pre-init requests
+
+# flight_plan_loaded is dispatched off the request thread (see
+# _emit_flight_plan_loaded_async); these guard against a pile-up of workers.
+_flight_plan_sync_lock = Lock()
+_flight_plan_sync_running = False
+_pending_flight_plan = None
 from core.addon_installer import get_installer, load_dlc_catalog, current_progress
 from core import telemetry as _telemetry_mod
 from core import stats as _stats_mod
@@ -235,7 +241,39 @@ def _sync_runtime_from_config():
     fp = shared_context['flight_plan']
     if fp.get('origin') != 'N/A' or fp.get('destination') != 'N/A':
         print(f"System: Flight plan initialized to {fp['origin']} -> {fp['destination']}")
-        event_bus.emit('flight_plan_loaded', fp)
+        _emit_flight_plan_loaded_async(fp)
+
+
+def _emit_flight_plan_loaded_async(fp):
+    """Notify listeners of a (re)loaded flight plan without blocking the caller.
+
+    The flight_plan_loaded listeners do heavy nav-data work: nearby-airport lookup,
+    an Overpass fetch for the departure airport, then a taxi-graph build and route
+    search. Running that inline inside /save_settings kept the HTTP response open
+    for minutes, which looked to the browser like a dead Save button. Coalesce
+    rapid repeats into a single background worker instead of spawning a thread each
+    time.
+    """
+    global _pending_flight_plan, _flight_plan_sync_running
+    with _flight_plan_sync_lock:
+        _pending_flight_plan = dict(fp)
+        if _flight_plan_sync_running:
+            return
+        _flight_plan_sync_running = True
+
+    def _drain():
+        global _pending_flight_plan, _flight_plan_sync_running
+        while True:
+            with _flight_plan_sync_lock:
+                plan = _pending_flight_plan
+                _pending_flight_plan = None
+            if plan is None:
+                with _flight_plan_sync_lock:
+                    _flight_plan_sync_running = False
+                return
+            event_bus.emit('flight_plan_loaded', plan)
+
+    threading.Thread(target=_drain, daemon=True, name='OF-FlightPlanSync').start()
 
 load_config()
 
