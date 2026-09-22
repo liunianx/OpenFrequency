@@ -727,6 +727,10 @@
         // Load cabin media packages from API (includes plugins)
         let cabinMediaPackages = [];
 
+        // Latest config from the server; saveConfig() reuses values the form has no
+        // control for (e.g. traffic.enabled) so they survive a save round-trip.
+        let currentConfig = null;
+
         async function loadCabinMediaPackages() {
             try {
                 const response = await fetch('/get_cabin_media_packages');
@@ -812,6 +816,8 @@
                     return;
                 }
                 const data = await response.json();
+
+                currentConfig = data;
 
                 const csInput = document.getElementById('conf-callsign');
                 const csLockIcon = document.getElementById('callsign-lock-icon');
@@ -957,7 +963,7 @@
                         traffic_radius_nm: parseInt(document.getElementById('conf-traffic-radius').value || '40', 10)
                     },
                     traffic: {
-                        enabled: data.traffic?.enabled ?? true,
+                        enabled: currentConfig?.traffic?.enabled ?? true,
                         msfs_ai_enabled: document.getElementById('conf-msfs-ai-enabled').checked,
                         traffic_radius_nm: parseInt(document.getElementById('conf-traffic-radius').value || '40', 10),
                         sequencer_enabled: document.getElementById('conf-sequencer-enabled').checked
