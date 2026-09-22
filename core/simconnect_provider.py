@@ -54,6 +54,16 @@ class SimConnectProvider(SimProvider):
     
     def is_connected(self) -> bool:
         return self._connected
+
+    def probe_ai_traffic_capability(self) -> bool:
+        """C3：探测当前连接的 DLL 是否支持 AI 枚举所需的
+        RequestDataOnSimObjectType（AI 交通读取的前置能力）。"""
+        if self.sc is None:
+            return False
+        try:
+            return hasattr(self.sc.dll, 'RequestDataOnSimObjectType')
+        except Exception:
+            return False
     
     def _get(self, key, default=0):
         """Safely get a SimConnect variable."""

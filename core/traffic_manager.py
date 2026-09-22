@@ -31,7 +31,7 @@ class AircraftTrackingData:
     state: TrafficState = TrafficState.UNKNOWN
     pending_state: Optional[TrafficState] = None  # State waiting for hysteresis confirmation
     pending_state_start: float = 0.0  # When pending state was first detected
-    
+
     # Telemetry
     latitude: float = 0.0
     longitude: float = 0.0
@@ -40,16 +40,24 @@ class AircraftTrackingData:
     airspeed: float = 0.0
     vertical_speed: float = 0.0
     on_ground: bool = True
-    
+
     # Previous frame data (for change detection)
     prev_latitude: float = 0.0
     prev_longitude: float = 0.0
     prev_heading: float = 0.0
     prev_on_ground: bool = True
-    
+
     # Metadata
     last_seen: float = field(default_factory=time.time)
     voice_id: Optional[str] = None  # Assigned TTS voice
+
+    # C1/C2: SimConnect AI 枚举补充字段（X-Plane/mock 留空）
+    aircraft_type: str = ""            # ATC TYPE（ICAO 机型，如 B738）
+    wake_category: str = "UNKNOWN"     # 由 ATC TYPE 推导（ICAO Doc 4444）
+    assigned_runway: Optional[str] = None   # AI_TRAFFIC_ASSIGNED_RUNWAY
+    assigned_parking: Optional[str] = None  # AI_TRAFFIC_ASSIGNED_PARKING
+    icao_dest: Optional[str] = None         # AI_TRAFFIC_TOAIRPORT
+    eta_s: Optional[float] = None           # AI_TRAFFIC_ETA（秒）
 
 class TrafficStateManager:
     """
@@ -80,8 +88,40 @@ class TrafficStateManager:
         self.enabled = config.get('traffic', {}).get('enabled', True)
         self.self_managed_enabled = config.get('traffic', {}).get('self_managed_enabled', True)
         self.export_limit = int(config.get('traffic', {}).get('export_limit', 63) or 63)
-        
+        # C1/C2：MSFS AI 交通枚举读取器（独立 SimConnect 连接，线程隔离）
+        self.msfs_ai_enabled = bool(config.get('traffic', {}).get('msfs_ai_enabled', True))
+        self._traffic_reader = None
+        self._reader_failed = False
+
         print("TrafficStateManager: Initialized.")
+
+    @property
+    def traffic_source_state(self) -> str:
+        """当前交通源形态：live / static / none / unavailable（E11）。"""
+        reader = self._traffic_reader
+        if reader is None or not getattr(reader, 'available', False):
+            return 'unavailable'
+        return getattr(reader, 'source_state', 'unavailable')
+
+    def _ensure_traffic_reader(self):
+        """惰性创建 AI 交通读取器。失败只记录一次并保持 None（降级 mock）。"""
+        if self._traffic_reader is not None or self._reader_failed:
+            return self._traffic_reader
+        if not self.msfs_ai_enabled:
+            self._reader_failed = True
+            return None
+        try:
+            from .simconnect_traffic import SimConnectTrafficReader
+        except Exception as e:
+            print(f"TrafficStateManager: simconnect_traffic import failed — {e}")
+            self._reader_failed = True
+            return None
+        reader = SimConnectTrafficReader(self.config)
+        if not reader.start():
+            self._reader_failed = True
+            return None
+        self._traffic_reader = reader
+        return reader
     
     def start(self):
         if self.enabled:
@@ -92,10 +132,17 @@ class TrafficStateManager:
     
     def stop(self):
         self._stop_event.set()
+        reader = self._traffic_reader
+        if reader is not None:
+            try:
+                reader.stop()
+            except Exception as e:
+                print(f"TrafficStateManager: reader stop error: {e}")
     
     def _loop(self):
         """Main scanning loop."""
         last_bulk_update = 0
+        last_source_emit = 0
         self._xplane_tcas_failed = False  # flip to True only after confirmed failure
 
         while not self._stop_event.is_set():
@@ -130,6 +177,19 @@ class TrafficStateManager:
             if now - last_bulk_update > 1.0:
                 self._emit_bulk_update()
                 last_bulk_update = now
+
+            # 3. 交通源形态（C3/E11）：每 5 秒推一次给 UI 状态栏
+            if now - last_source_emit > 5.0:
+                last_source_emit = now
+                if self.socketio:
+                    try:
+                        self.socketio.emit('traffic_source_state', {
+                            'state': self.traffic_source_state,
+                            'ai_count': len(self.aircraft),
+                            'msfs_ai_enabled': self.msfs_ai_enabled,
+                        })
+                    except Exception:
+                        pass
 
             time.sleep(self.SCAN_INTERVAL)
 
@@ -246,47 +306,37 @@ class TrafficStateManager:
         print(f"TrafficStateManager: Spawning Mock Traffic {callsign} (Type {atype})")
 
     def _scan_traffic(self):
-        """Scan SimConnect for AI aircraft using request_data_on_simobject."""
+        """MSFS：用 SimConnectTrafficReader 枚举 AI 飞机（C1/C2）。
+
+        旧实现 hasattr(sm,'get_ai_aircraft_list') 恒为假 -> 永远落 mock。
+        现在：枚举成功且非空 -> update_aircraft；枚举失败 / 零交通且配置允许
+        mock 时 -> 退回 enhanced mock。交通源形态记入日志（live/static/none）。
+        """
         try:
             if not self.sim_bridge or not self.sim_bridge.connected:
                 return
-            
-            sm = self.sim_bridge.sm  # SimConnect instance
-            if not sm:
-                return
-            
-            # Try to get AI traffic using SimConnect's object enumeration
-            # FSLTL and other AI traffic injectors create AI objects
-            try:
-                from SimConnect import SIMCONNECT_OBJECT_ID_USER
-                
-                # Request AI traffic data using the built-in AI traffic request
-                # This requires SimConnect SDK access to enumerate objects
-                # For now, we'll use an alternative approach via Python-SimConnect library
-                
-                # Method 1: Try to use AircraftRequests on AI objects if available
-                if hasattr(sm, 'get_ai_aircraft_list'):
-                    ai_list = sm.get_ai_aircraft_list()
-                    for ai_obj in ai_list:
-                        self._process_ai_object(ai_obj)
-                        
-                # Method 2: Use lower-level SimConnect API if available
-                elif hasattr(sm, 'SendRequest'):
-                    # This would enumerate all AI objects - complex implementation
-                    # For compatibility, fall back to mock traffic
-                    if not self.aircraft:  # No traffic detected, generate some
-                        self._generate_enhanced_mock_traffic()
-                else:
-                    # Fall back to enhanced mock traffic
+
+            reader = self._ensure_traffic_reader()
+            if reader is None or not reader.available:
+                # 读取器不可用（无 SimConnect / DLL 缺能力）：保持既有降级行为
+                if not self.aircraft:
                     self._generate_enhanced_mock_traffic()
-                    
-            except ImportError:
-                # SimConnect not available, use mock
-                self._generate_enhanced_mock_traffic()
-                
+                return
+
+            targets = reader.poll_once()
+            if targets:
+                for ai in targets:
+                    if not ai.get('callsign'):
+                        continue
+                    self._process_ai_object(ai)
+            elif not self.aircraft:
+                # 无注入器 / 零交通现场：队列按"空队列即放行"处理（E11）
+                if self.config.get('debug', {}).get('mock_traffic_fallback', True):
+                    self._generate_enhanced_mock_traffic()
         except Exception as e:
             print(f"TrafficStateManager: Scan error: {e}")
-            self._generate_enhanced_mock_traffic()
+            if not self.aircraft:
+                self._generate_enhanced_mock_traffic()
     
     def _scan_xplane_tcas(self):
         """Read LiveTraffic / AI traffic from X-Plane TCAS target arrays via Web API."""
@@ -323,11 +373,11 @@ class TrafficStateManager:
         # _cleanup_stale() will remove them after STALE_TIMEOUT seconds
 
     def _process_ai_object(self, ai_data):
-        """Process a single AI aircraft object from SimConnect."""
+        """处理单个 AI 对象（C1 的结构化 dict：callsign/位置/机型/尾流/分配跑道等）。"""
         callsign = ai_data.get('callsign', ai_data.get('atc_id', 'UNKNOWN'))
         if not callsign or callsign == 'UNKNOWN':
             return
-        
+
         # Update traffic data
         self.update_aircraft(callsign, {
             'latitude': ai_data.get('latitude', 0),
@@ -336,7 +386,13 @@ class TrafficStateManager:
             'heading': ai_data.get('heading', 0),
             'airspeed': ai_data.get('airspeed', 0),
             'vertical_speed': ai_data.get('vertical_speed', 0),
-            'on_ground': ai_data.get('on_ground', True)
+            'on_ground': ai_data.get('on_ground', True),
+            'aircraft_type': ai_data.get('aircraft_type', ''),
+            'wake_category': ai_data.get('wake_category', 'UNKNOWN'),
+            'assigned_runway': ai_data.get('assigned_runway'),
+            'assigned_parking': ai_data.get('assigned_parking'),
+            'icao_dest': ai_data.get('icao_dest'),
+            'eta_s': ai_data.get('eta_s'),
         })
     
     def _generate_enhanced_mock_traffic(self):
@@ -378,9 +434,15 @@ class TrafficStateManager:
                     'spd': ac.airspeed,
                     'vs': ac.vertical_speed,
                     'state': ac.state.name,
-                    'on_ground': ac.on_ground
+                    'on_ground': ac.on_ground,
+                    # C1/C2 新字段（X-Plane/mock 下为默认值）
+                    'type': ac.aircraft_type,
+                    'wake': ac.wake_category,
+                    'rwy': ac.assigned_runway,
+                    'stand': ac.assigned_parking,
+                    'dest': ac.icao_dest,
                 })
-            
+
             if traffic_list:
                 event_bus.emit('traffic_update', traffic_list)
                 # Also emit directly to Socket.IO for frontend
@@ -440,6 +502,15 @@ class TrafficStateManager:
             ac.vertical_speed = data.get('vertical_speed', ac.vertical_speed)
             ac.on_ground = data.get('on_ground', ac.on_ground)
             ac.last_seen = time.time()
+            # C1/C2：机型/尾流/分配信息（仅 MSFS AI 枚举提供；X-Plane/mock 不含这些键）
+            for attr, key in (('aircraft_type', 'aircraft_type'),
+                              ('wake_category', 'wake_category'),
+                              ('assigned_runway', 'assigned_runway'),
+                              ('assigned_parking', 'assigned_parking'),
+                              ('icao_dest', 'icao_dest'),
+                              ('eta_s', 'eta_s')):
+                if key in data and data[key] not in (None, ''):
+                    setattr(ac, attr, data[key])
             
             # Check for teleport
             if self._check_teleport(ac):

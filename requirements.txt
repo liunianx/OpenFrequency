@@ -5,7 +5,7 @@ python-socketio==5.11.0
 gevent>=24.2.1
 
 # Simulator Connectors
-SimConnect
+SimConnect==0.4.8
 # xpc  # Uncomment for X-Plane support (pip install XPlaneConnect)
 psutil>=5.9.0
 
