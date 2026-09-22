@@ -188,6 +188,7 @@ ROLE_TEXT_ALIASES = [
     ("Departure", ("离场", "departure")),
     ("Approach", ("进近", "approach")),
     ("Center", ("区调", "区域管制", "区域", "中心", "centre", "center", "radar")),
+    ("ATIS", ("通波", "atis")),
 ]
 
 # 频率问题

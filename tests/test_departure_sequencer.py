@@ -167,7 +167,8 @@ class LogicManagerWiringTests(unittest.TestCase):
 
     def _build(self, entries):
         from core.logic_manager import LogicManager
-        cfg = {"frequencies": {}, "audio": {"stt_language": "zh"}, "debug": {}}
+        cfg = {"frequencies": {}, "audio": {"stt_language": "zh"}, "debug": {},
+               "traffic": {"sequencer_enabled": True}}
 
         class _IO:
             def __init__(self):

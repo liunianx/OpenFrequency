@@ -197,6 +197,12 @@ class QuickReplyEngine:
         atc = shared_ctx.get('atc_state', {})
         env = shared_ctx.get('environment', {})
         issued = atc.get('issued_instructions', {})
+        session_state = atc.get('session', {}) or {}
+        assigned = session_state.get('assigned', {}) or {}
+
+        def _assigned(field):
+            entry = assigned.get(field) or {}
+            return entry.get('value') or ''
 
         # Best guess at current runway from issued instructions or environment
         runway = (issued.get('departure_runway')
@@ -217,6 +223,11 @@ class QuickReplyEngine:
             'spd':       issued.get('assigned_speed', str(ac.get('airspeed', ''))),
             'qnh':       str(env.get('qnh', '')),
             'waypoint':  '',   # filled from UI when needed
+            # A3/D3：到达侧停机位与进港滑行路线（供 dispatch/gate 类模板使用）
+            'gate':      _assigned('assigned_gate'),
+            'stand':     _assigned('assigned_gate'),
+            'sid':       _assigned('sid'),
+            'star':      _assigned('star'),
         }
 
     @staticmethod

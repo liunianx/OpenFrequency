@@ -236,6 +236,37 @@ class SimbriefAndFallbackTests(unittest.TestCase):
         self.assertIsNot(first, second)
 
 
+class PromptBlockTests(unittest.TestCase):
+    """B1：procedures prompt 块（真实程序逐字 / llm 兜底显式标注）。"""
+
+    @staticmethod
+    def _block(context_copy):
+        from core.llm_client import LLMClient
+        client = LLMClient.__new__(LLMClient)      # 绕过 __init__（无 genai 依赖）
+        client.procedure_service = None
+        return client._build_procedures_block(context_copy)
+
+    def test_real_procedures_listed_with_source(self):
+        block = self._block({"navigation": {"procedures": {
+            "SID": [{"ident": "LENDY6", "type": "SID", "runway": "13L",
+                     "transitions": ["RW13L"], "source": "cifp"}],
+            "STAR": [], "APPROACH": [], "source": "cifp"}}})
+        self.assertIn("LENDY6", block)
+        self.assertIn("source: cifp", block)
+        self.assertIn("VERBATIM", block)
+
+    def test_llm_fallback_explicitly_marked(self):
+        block = self._block({"navigation": {"procedures": {
+            "SID": [], "STAR": [], "APPROACH": [], "source": "llm"}}})
+        self.assertIn("source: llm", block)
+        self.assertIn("MAY generate plausible procedure", block)
+
+    def test_off_source_emits_nothing(self):
+        block = self._block({"navigation": {"procedures": {
+            "SID": [], "STAR": [], "APPROACH": [], "source": "off"}}})
+        self.assertEqual(block, "")
+
+
 class TruncationAssignTests(unittest.TestCase):
     """E4：SimBrief ident 截断 1 字符时，逻辑管理器仍能匹配本地库并写入权威字段。"""
 

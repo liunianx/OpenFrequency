@@ -37,6 +37,10 @@ class LogicManager:
         # D1：离场排队（模拟器无关；traffic_manager 由 app.py 启动后注入）
         self.departure_sequencer = DepartureSequencer(
             config, traffic_manager=None, taxi_router=self.taxi_router)
+        # traffic.sequencer_enabled 默认 false：关闭时排队器不拦截、不注入 prompt，
+        # 完全回到升级前行为（§12 回滚策略）
+        self._sequencer_enabled = bool(
+            (config.get('traffic', {}) or {}).get('sequencer_enabled', False))
         self.workload_sim = WorkloadSimulator(config)
         self.scheduler = None
         self.last_freq = 0.0
@@ -308,6 +312,8 @@ class LogicManager:
         self.template_responder.airport_frequency_service = self.airport_frequency_service
         if self.procedure_service:
             self.procedure_service.config = new_config
+        self._sequencer_enabled = bool(
+            (new_config.get('traffic', {}) or {}).get('sequencer_enabled', False))
 
     def _sync_flight_rules(self):
         """把 shared_context['flight_rules'] 同步进 session（E12：VFR 必须在
@@ -359,6 +365,8 @@ class LogicManager:
 
     def _on_traffic_state_change(self, event_data):
         """AI 飞机状态变化（traffic_state_change）→ 队列重算。"""
+        if not self._sequencer_enabled:
+            return
         if self.atc_session.phase in ('TOWER_DEP', 'GROUND_DEP'):
             self._refresh_departure_queue()
 
@@ -451,6 +459,11 @@ class LogicManager:
             if arr and arr != 'N/A':
                 procs["STAR"] = self.procedure_service.get_stars(arr, arr_rwy)
                 procs["APPROACH"] = self.procedure_service.get_approaches(arr, arr_rwy)
+            # B1：显式标注最终生效的数据源；全无数据时为 'llm'（由 LLM 生成）
+            first_hit = next((procs[k] for k in ("SID", "STAR", "APPROACH") if procs[k]), [])
+            procs["source"] = (first_hit[0].get("source") if first_hit
+                               else ("off" if self.procedure_service.source_preference == "off"
+                                     else "llm"))
             with context_lock:
                 shared_context['navigation']['procedures'] = procs
         except Exception as e:
@@ -1300,7 +1313,8 @@ class LogicManager:
 
         # ── D2: Tier-0 起飞排队插点（跑道/应答机 prereq 通过之后） ────────────
         # 插在 prereq 之后，避免与 missing_runway 重定向冲突。
-        if check['allowed'] and check['action'] == 'takeoff' \
+        # 仅 traffic.sequencer_enabled=true 时拦截；关闭时行为与升级前一致。
+        if self._sequencer_enabled and check['allowed'] and check['action'] == 'takeoff' \
                 and tuned_role == 'Tower' and self.atc_session.phase == 'TOWER_DEP':
             self._refresh_departure_queue()
             callsign = self._resolve_callsign(ctx_snapshot)

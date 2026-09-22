@@ -96,6 +96,10 @@ class ProcedureService:
 
     # ── 源链调度 ────────────────────────────────────────────────────────────
 
+    @property
+    def source_preference(self) -> str:
+        return self._source_pref()
+
     def _source_pref(self) -> str:
         pref = ((self.config.get("navdata", {}) or {}).get("procedure_source") or "auto").lower()
         return pref if pref in ("auto", "lnm", "cifp", "simbrief", "llm", "off") else "auto"
@@ -134,6 +138,19 @@ class ProcedureService:
         with self._cache_lock:
             self._cache[cache_key] = result
         return result
+
+    def describe_source(self, procs) -> str:
+        """把一组查询结果归纳成 source 标注（B1 的 LLM 兜底要显式标注）。
+
+        全部源均无数据且允许 LLM 时返回 'llm'（调用方据此提示模型自行生成）；
+        procedure_source=off 时返回 'off'。
+        """
+        if self._source_pref() == "off":
+            return "off"
+        for proc in procs or []:
+            if proc.get("source"):
+                return proc["source"]
+        return "llm"
 
     # ── 源 1：LittleNavMap SQLite ───────────────────────────────────────────
 

@@ -240,6 +240,31 @@
                             </select>
                         </div>
 
+                        <!-- AI 交通 / 离场排队 -->
+                        <h6 class="border-bottom pb-1 mb-2 mt-3" data-i18n="traffic_settings">✈️ AI 交通与离场排队</h6>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="conf-msfs-ai-enabled">
+                            <label class="form-check-label small" data-i18n="msfs_ai_enabled">读取 MSFS AI 交通
+                                (SimConnect)</label>
+                            <div class="form-text x-small text-muted">关闭后交通维持 mock；需装有
+                                <code>SimConnect</code> 包且模拟器在运行。</div>
+                        </div>
+                        <div class="mt-2">
+                            <label class="form-label small mb-0" data-i18n="traffic_radius">AI 交通半径
+                                (NM)</label>
+                            <input type="number" class="form-control form-control-sm" id="conf-traffic-radius"
+                                min="1" max="100" placeholder="40">
+                            <div class="form-text x-small text-muted">MSFS 上限约 108 NM；本实现 clamp 到
+                                100 NM。</div>
+                        </div>
+                        <div class="form-check mt-2">
+                            <input class="form-check-input" type="checkbox" id="conf-sequencer-enabled">
+                            <label class="form-check-label small" data-i18n="sequencer_enabled">启用离场排队
+                                (Departure Sequencer)</label>
+                            <div class="form-text x-small text-muted">开启后塔台按 ICAO 尾流间隔计算
+                                “排在第 N 位”；间隔为工程估算值。</div>
+                        </div>
+
                         <!-- TTS + STT Voice Engine -->
                         <h6 class="border-bottom pb-1 mb-2 mt-3" data-i18n="voice_engine">🔊 语音引擎（TTS / STT）</h6>
                         <div class="mb-2">
@@ -823,6 +848,11 @@
                 document.getElementById('conf-osm-overpass-url').value = data.navdata?.osm_overpass_url || 'https://overpass-api.de/api/interpreter';
                 document.getElementById('conf-navdata-sqlite-path').value = data.navdata?.sqlite_path || '';
                 document.getElementById('conf-procedure-source').value = data.navdata?.procedure_source || 'auto';
+                document.getElementById('conf-msfs-ai-enabled').checked = data.traffic?.msfs_ai_enabled ?? true;
+                document.getElementById('conf-traffic-radius').value =
+                    data.traffic?.traffic_radius_nm ?? data.navdata?.traffic_radius_nm ?? 40;
+                document.getElementById('conf-sequencer-enabled').checked =
+                    data.traffic?.sequencer_enabled ?? false;
                 document.getElementById('conf-radio-effect').checked = data.audio?.radio_effect ?? false;
                 document.getElementById('conf-stt-path').value = data.audio?.stt_model_path || '';
                 document.getElementById('conf-stt-language').value = data.audio?.stt_language || 'en';
@@ -923,7 +953,14 @@
                         ground_source: document.getElementById('conf-ground-source').value,
                         osm_overpass_url: document.getElementById('conf-osm-overpass-url').value.trim() || 'https://overpass-api.de/api/interpreter',
                         sqlite_path: document.getElementById('conf-navdata-sqlite-path').value.trim(),
-                        procedure_source: document.getElementById('conf-procedure-source').value
+                        procedure_source: document.getElementById('conf-procedure-source').value,
+                        traffic_radius_nm: parseInt(document.getElementById('conf-traffic-radius').value || '40', 10)
+                    },
+                    traffic: {
+                        enabled: data.traffic?.enabled ?? true,
+                        msfs_ai_enabled: document.getElementById('conf-msfs-ai-enabled').checked,
+                        traffic_radius_nm: parseInt(document.getElementById('conf-traffic-radius').value || '40', 10),
+                        sequencer_enabled: document.getElementById('conf-sequencer-enabled').checked
                     },
                     audio: {
                         radio_effect: document.getElementById('conf-radio-effect').checked,

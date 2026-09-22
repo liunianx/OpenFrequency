@@ -49,6 +49,7 @@ Simulation enthusiasts deserve an immersion system that:
 - **MSFS / P3D / FSX** via SimConnect (SDK auto-bundled — no manual download needed)
 - **X-Plane 12** via official Local Web API
 - **AI Traffic Awareness**: LiveTraffic / MSFS AI aircraft state reading
+- **Data availability matrix**: see [docs/SIMULATOR_DATA_MATRIX.md](docs/SIMULATOR_DATA_MATRIX.md) — what in-game data each simulator actually exposes (SID/STAR, ground layout, AI traffic), and the fallback chain for each
 
 ### Plugin System
 - **🔌 Plugin API**: Base class with lifecycle hooks, manifest metadata, dynamic loading.

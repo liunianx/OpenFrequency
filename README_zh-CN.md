@@ -49,6 +49,7 @@
 - **MSFS / P3D / FSX**：通过 SimConnect（SDK 自动打包，无需手动下载）
 - **X-Plane 12**：通过官方 Local Web API
 - **AI 流量感知**：支持读取 LiveTraffic / MSFS AI 飞机状态
+- **数据可得性矩阵**：见 [docs/SIMULATOR_DATA_MATRIX.md](docs/SIMULATOR_DATA_MATRIX.md)——各模拟器实际能读出哪些游戏内数据（SID/STAR、滑行图、AI 交通）及各自的降级链
 
 ### 插件系统
 - **🔌 插件 API**：基类提供生命周期钩子、manifest 元数据和动态加载。

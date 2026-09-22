@@ -314,6 +314,87 @@
       "template_en": "{callsign}, frequency change approved.",
       "template_zh": "{callsign}，允许更换频率。",
       "template_ja": "{callsign}、周波数変更を承認します。"
+    },
+
+    {
+      "id": "pdc_approved",
+      "label": "PDC Approved",
+      "label_zh": "预放行批准",
+      "category": "dispatch",
+      "roles": ["Dispatch"],
+      "triggers": ["pdc", "predeparture clearance", "预放行"],
+      "triggers_zh": ["预放行", "申请预放行"],
+      "template_en": "{callsign}, predeparture clearance approved — read back the PDC and contact ATIS.",
+      "template_zh": "{callsign}，预放行已批准，请复诵并联系通波。",
+      "template_ja": "{callsign}、プリデパーチャークリアランスを承認します。リードバックしてATISへ。"
+    },
+
+    {
+      "id": "fpl_confirmed",
+      "label": "Flight Plan Confirmed",
+      "label_zh": "领航计划已确认",
+      "category": "dispatch",
+      "roles": ["Dispatch", "Clearance Delivery"],
+      "triggers": ["wilco", "flight plan", "领航计划"],
+      "triggers_zh": ["复诵", "确认", "领航计划"],
+      "template_en": "{callsign}, flight plan confirmed, contact ATIS.",
+      "template_zh": "{callsign}，领航计划已确认，请联系通波。",
+      "template_ja": "{callsign}、飛行計画を確認しました。ATISへコンタクトしてください。"
+    },
+
+    {
+      "id": "gate_assigned_arrival",
+      "label": "Gate {gate} Assigned",
+      "label_zh": "停机位{gate}已分配",
+      "category": "arrival_ground",
+      "roles": ["Ground"],
+      "triggers": ["gate", "stand"],
+      "triggers_zh": ["停机位", "廊桥", "gate"],
+      "template_en": "{callsign}, cleared to gate {gate}.",
+      "template_zh": "{callsign}，可以滑行至停机位{gate}。",
+      "template_ja": "{callsign}、ゲート{gate}まで走行を許可します。",
+      "variables": ["gate"]
+    },
+
+    {
+      "id": "taxi_to_gate",
+      "label": "Taxi to Gate",
+      "label_zh": "滑行至停机位",
+      "category": "arrival_ground",
+      "roles": ["Ground"],
+      "triggers": ["taxi to gate", "taxi to stand"],
+      "triggers_zh": ["滑行到停机位", "滑到廊桥"],
+      "template_en": "{callsign}, taxi to gate {gate} via {taxi_route}.",
+      "template_zh": "{callsign}，经{taxi_route}滑行至停机位{gate}。",
+      "template_ja": "{callsign}、{taxi_route}経由でゲート{gate}までタクシー。",
+      "variables": ["gate", "taxi_route"]
+    },
+
+    {
+      "id": "gate_hold_short",
+      "label": "Hold Short of Gate",
+      "label_zh": "停机位前等待",
+      "category": "gate",
+      "roles": ["Ground"],
+      "triggers": ["hold short of gate", "gate hold"],
+      "triggers_zh": ["停机位前等待", "到廊桥前停"],
+      "template_en": "{callsign}, hold short of gate {gate}, wait for marshaller.",
+      "template_zh": "{callsign}，停机位{gate}前等待，听从信号员指挥。",
+      "template_ja": "{callsign}、ゲート{gate}手前で停止、マーシャラーに従ってください。",
+      "variables": ["gate"]
+    },
+
+    {
+      "id": "gate_contact_ground",
+      "label": "Contact Ground for Gate",
+      "label_zh": "联系地面获取停机位",
+      "category": "gate",
+      "roles": ["Tower", "Approach", "Departure", "Center"],
+      "triggers": ["gate assignment", "request gate"],
+      "triggers_zh": ["申请停机位", "询问停机位"],
+      "template_en": "{callsign}, contact Ground for gate assignment.",
+      "template_zh": "{callsign}，联系地面分配停机位。",
+      "template_ja": "{callsign}、ゲート指定はグランドへコンタクト。"
     }
 
   ],
@@ -325,6 +406,9 @@
     "enroute":         { "label": "ENR", "label_zh": "航路", "color": "primary" },
     "clearance":       { "label": "CLR", "label_zh": "放行", "color": "info" },
     "handoff":         { "label": "HND", "label_zh": "移交", "color": "dark" },
-    "request":         { "label": "REQ", "label_zh": "请求", "color": "light" }
+    "request":         { "label": "REQ", "label_zh": "请求", "color": "light" },
+    "dispatch":        { "label": "DSP", "label_zh": "签派", "color": "info" },
+    "arrival_ground":  { "label": "ARG", "label_zh": "到达地面", "color": "warning" },
+    "gate":            { "label": "GTE", "label_zh": "停机位", "color": "secondary" }
   }
 }

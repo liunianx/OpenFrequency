@@ -3,6 +3,11 @@
         "callsign": "CCA1024",
         "pilot_voice_preference": "male"
     },
+    "simulator": {
+        "provider": "auto",
+        "xplane_host": "127.0.0.1",
+        "xplane_root": ""
+    },
     "connection": {
         "provider": "gemini",
         "api_key": "YOUR_API_KEY_HERE",
@@ -31,7 +36,16 @@
         "ground_source": "simulator",
         "sqlite_path": "path/to/little_navmap_navigraph.sqlite",
         "procedure_source": "auto",
-        "osm_overpass_url": "https://overpass-api.de/api/interpreter"
+        "osm_overpass_url": "https://overpass-api.de/api/interpreter",
+        "traffic_radius_nm": 40
+    },
+    "traffic": {
+        "enabled": true,
+        "msfs_ai_enabled": true,
+        "traffic_radius_nm": 40,
+        "sequencer_enabled": false,
+        "chatter_enabled": true,
+        "wake_sep_seconds": null
     },
     "immersion": {
         "busy_level": "medium",

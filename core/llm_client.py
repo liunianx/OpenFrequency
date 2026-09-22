@@ -1,8 +1,15 @@
 import json
 import copy
-from google import genai
-from google.genai import types
-import openai
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:  # 开发/测试环境可能没装 google-genai；按 provider 惰性使用
+    genai = None
+    types = None
+try:
+    import openai
+except ImportError:
+    openai = None
 
 from core.china_airspace import is_in_china_airspace, build_china_rvsm_prompt_block
 from core.atc_session import (ATCSession, PHASE_LABEL_ZH, PHASE_ROLE, ROLE_FREQ_FALLBACKS,
@@ -797,7 +804,14 @@ class LLMClient:
         sids = procs.get('SID') or []
         stars = procs.get('STAR') or []
         approaches = procs.get('APPROACH') or []
+        source = procs.get('source') or ''
         if not (sids or stars or approaches):
+            if source == 'llm':
+                # B1：所有本地源都无数据——显式允许（且仅允许）LLM 自行生成程序名
+                return ("PROCEDURES (source: llm): no SID/STAR/approach entry exists in any local "
+                        "navigation source for this flight. You MAY generate plausible procedure "
+                        "identifiers consistent with the filed route, and you MUST NOT claim they "
+                        "are published procedures.")
             return ""
 
         def _fmt(proc):
