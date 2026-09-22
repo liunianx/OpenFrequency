@@ -10,6 +10,10 @@ from typing import Callable, Optional
 
 import requests
 
+# Overpass API answers 406 Not Acceptable to the default python-requests
+# User-Agent, so we identify ourselves instead.
+USER_AGENT = "OpenFrequency/3.9 (+https://github.com/liunianx/OpenFrequency)"
+
 
 class OSMGroundService:
     def __init__(self, config: dict, airport_lookup: Optional[Callable[[str], Optional[dict]]] = None):
@@ -75,7 +79,12 @@ class OSMGroundService:
 out body;
 """
         try:
-            resp = requests.post(endpoint, data={"data": query}, timeout=30)
+            resp = requests.post(
+                endpoint,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=30,
+            )
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
