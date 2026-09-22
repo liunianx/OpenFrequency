@@ -893,7 +893,10 @@ class ATCSession:
             }
 
         expected_role = PHASE_ROLE[phase]
-        if tuned_role and expected_role and tuned_role != expected_role:
+        # DISPATCH 豁免调频一致性检查（E13）：PDC 走数据链，UI 上显示的 CD 频率
+        # 仅供展示，飞行员无论在不在语音频率上都可提交/复诵预放行。
+        if tuned_role and expected_role and tuned_role != expected_role \
+                and phase != "DISPATCH":
             return {
                 "allowed": False,
                 "action": action,

@@ -185,6 +185,23 @@ class LogicManagerDispatchTests(unittest.TestCase):
         self.assertEqual(session.phase, "ATIS")
         self.assertTrue(session.state["fpl_confirmed"])
 
+    def test_pdc_allowed_while_tuned_to_clearance_frequency(self):
+        # E13：DISPATCH 显示的 CD 频率仅供 UI；守听 CD 也不该把 PDC 请求弹回去
+        lm, session, io = self._build()
+        lm.on_flight_plan_loaded({"origin": "ZGGG", "destination": "ZGSZ",
+                                  "cruise_alt": 25000})
+        lm.switch_frequency_context(121.95, source="pilot")
+        # tune 到 CD 会把阶段对齐到 CLEARANCE；此时再请求 PDC 也不应被 wrong_station 拦截
+        result = session.check_request("申请预放行", tuned_role="Clearance Delivery")
+        self.assertTrue(result["allowed"])
+        # 未调频（tuned_role=None/N/A）同样放行
+        session2 = ATCSession({}, None)
+        session2.attach({})
+        session2.load_from_flight_plan({"origin": "ZGGG", "destination": "ZGSZ"})
+        self.assertEqual(session2.phase, "DISPATCH")
+        self.assertTrue(session2.check_request("申请预放行", tuned_role=None)["allowed"])
+        self.assertTrue(session2.check_request("申请预放行", tuned_role="N/A")["allowed"])
+
     def test_vfr_skips_dispatch_entirely(self):
         lm, session, io = self._build()
         lm.on_flight_plan_loaded({"origin": "ZGGG", "destination": "ZGSZ",

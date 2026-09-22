@@ -15,6 +15,8 @@ class ATCTemplateResponder:
         entities = entities or {}
 
         callsign = aircraft.get("callsign", "Aircraft")
+        if str(callsign).strip().upper() in ("", "N/A", "NONE", "UNKNOWN"):
+            callsign = "Aircraft"
         role = atc_state.get("current_controller", "ATC")
         current_airport = environment.get("current_airport") or environment.get("nearest_airport") or flight_plan.get("origin") or "N/A"
         current_airport = str(current_airport).upper()
