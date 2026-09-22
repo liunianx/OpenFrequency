@@ -154,6 +154,34 @@ def _decode_record(values_bytes: bytes, field_names):
     return out
 
 
+def _make_traffic_simconnect_class():
+    """惰性构造 SimConnect 子类（仅在真机、装了 SimConnect 时导入）。
+
+    为什么需要子类：python-SimConnect 的分发回调（my_dispatch_proc_rd →
+    SIMCONNECT_RECV_ID_SIMOBJECT_DATA_BYTYPE）只会调用 SimConnect 实例自身
+    的 `handle_simobject_event`。本 reader 是独立类，必须让真正连着 sim 的
+    那个实例的回调转发进来，否则回包无人接收、`_table` 恒空（C1 根因）。
+
+    子类持一个 `_traffic_sink`：reader 在 start() 里把自己挂上去，收到
+    的每个 BYTYPE 包先转给 reader；未挂（未启动/已停止）时退回基类默认
+    实现，保证库自身行为不丢。测试可用 `traffic_sm_factory` 注入替身。
+    """
+    from SimConnect import SimConnect
+
+    class _TrafficSimConnect(SimConnect):
+        # reader 在 start() 里把自身挂到 _traffic_sink
+        _traffic_sink = None
+
+        def handle_simobject_event(self, ObjData):
+            sink = self._traffic_sink
+            if sink is not None:
+                sink.handle_simobject_event(ObjData)
+            else:
+                super().handle_simobject_event(ObjData)
+
+    return _TrafficSimConnect
+
+
 class SimConnectTrafficReader:
     """自建 SimConnect 连接枚举周边 AI 飞机，累积成表。
 
@@ -161,11 +189,20 @@ class SimConnectTrafficReader:
         reader = SimConnectTrafficReader(config)
         reader.start()             # 连接失败则 available=False，调用方降级
         targets = reader.poll_once()   # list[dict]，无新数据返回 []
+
+    线程模型（已对照 0.4.8 源码核实）：基类无后台 dispatch 线程，
+    start() 成功后由本 reader 自建 daemon 线程泵 CallDispatch；
+    stop() 先停线程、后关句柄。
     """
 
-    def __init__(self, config=None, connect_fn=None):
+    # _table 老化时间（秒）：BYTYPE 请求 2 Hz，对象离场后不再回包；留足
+    # 20 个周期余量（半径 100 NM 多对象枚举时首帧可能有延迟）再剔除。
+    _TABLE_TTL_SECONDS = 10.0
+
+    def __init__(self, config=None, connect_fn=None, traffic_sm_factory=None):
         self.config = config or {}
         self._connect_fn = connect_fn
+        self._traffic_sm_factory = traffic_sm_factory or _make_traffic_simconnect_class
         self._sm = None
         self._thread = None
         self._stop_event = threading.Event()
@@ -215,6 +252,8 @@ class SimConnectTrafficReader:
             if not hasattr(sm.dll, "RequestDataOnSimObjectType"):
                 raise AttributeError("SimConnect.dll 缺少 RequestDataOnSimObjectType")
             self._sm = sm
+            if hasattr(sm, "_traffic_sink"):
+                sm._traffic_sink = self          # 子类实例把回调转发给本 reader
             self._def_id = sm.new_def_id()
             self._request_id = sm.new_request_id()
             for name, unit, dtype_name in FIELD_TABLE:
@@ -223,6 +262,7 @@ class SimConnectTrafficReader:
                     sm.hSimConnect, self._def_id.value,
                     name.encode("ascii"), (unit or "").encode("ascii"),
                     dtype, 0, _simconnect_unused())
+            self._start_dispatch()                # 0.4.8 基类无后台 dispatch 线程，必须自建
             self._available = True
             print("SimConnectTrafficReader: connected (independent SimConnect client)")
             return True
@@ -231,14 +271,55 @@ class SimConnectTrafficReader:
             self._available = False
             self._source_state = SOURCE_UNAVAILABLE
             print(f"SimConnectTrafficReader: init failed — {e}")
+            self._stop_dispatch()
             self._safe_exit()
             return False
 
     def _connect_simconnect(self):
         if self._connect_fn is not None:
-            return self._connect_fn()
-        from SimConnect import SimConnect  # 仅 Windows + 装有 SimConnect 包时可用
-        return SimConnect(auto_connect=True)
+            return self._connect_fn()            # 测试注入：假实例
+        # 0.4.8 connect() 在 MSFS 未运行时走 `except OSError: exit(0)`，
+        # 而 exit() 抛 SystemExit（BaseException，穿透 except Exception），
+        # 会静默杀死整条交通扫描线程（见文件头根因）。此处显式兜 SystemExit。
+        try:
+            return self._traffic_sm_factory()(auto_connect=True)
+        except SystemExit:
+            raise ConnectionError("SimConnect exited during connect (MSFS not running?)")
+
+    # ── dispatch 线程（0.4.8 基类无后台线程，connect() 返回后全库再无
+    #    CallDispatch 调用点；必须自建，否则回包无人接收）。做进 commit 的
+    #    版本决策：锁死 SimConnect==0.4.8 + 自建线程；若将来升级 pin 到带
+    #    timerThread 的版本，删掉这段，否则两个线程对同一 hSimConnect 重入。──
+
+    def _start_dispatch(self):
+        if self._thread is not None:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._dispatch_loop, name="SimConnectTrafficDispatch", daemon=True)
+        self._thread.start()
+
+    def _stop_dispatch(self):
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=1.0)
+            self._thread = None
+
+    def _dispatch_loop(self):
+        sm = self._sm
+        dll = getattr(sm, "dll", None)
+        if sm is None or not hasattr(sm, "my_dispatch_proc_rd") \
+                or dll is None or not hasattr(dll, "CallDispatch"):
+            return                       # 不完整客户端（如测试替身）：无可泵
+        while not self._stop_event.is_set():
+            try:
+                sm.dll.CallDispatch(sm.hSimConnect, sm.my_dispatch_proc_rd, None)
+            except OSError:
+                break                   # 句柄已关（stop 竞态或 sim 退出）：直接退
+            except Exception as e:
+                self._last_error = str(e)
+            time.sleep(0.02)
 
     def _safe_exit(self):
         sm, self._sm = self._sm, None
@@ -249,8 +330,8 @@ class SimConnectTrafficReader:
                 pass
 
     def stop(self):
-        self._stop_event.set()
-        self._available = False
+        self._stop_dispatch()           # 先停线程、后关句柄，避免对已 Close 的
+        self._available = False         # handle 调 CallDispatch
         self._safe_exit()
 
     # ── 数据请求与接收 ──────────────────────────────────────────────────────
@@ -281,6 +362,7 @@ class SimConnectTrafficReader:
             raw = bytes(ObjData.dwData)
             values = _decode_record(raw, _FIELD_ORDER)
             values["_object_id"] = object_id
+            values["_last_seen"] = time.time()
             with self._lock:
                 self._table[(request_id, object_id)] = values
                 self._dirty = True
@@ -290,16 +372,30 @@ class SimConnectTrafficReader:
     def poll_once(self) -> list:
         """取走累积表中的当前快照（每帧 BYTYPE 只有单对象，故需累积）。
 
-        同时更新交通源形态推断。返回的 dict 已含 traffic_manager 需要的键；
-        无任何 AI 时返回空列表。
+        同时做两件事：
+          · 老化剔除（§P0-5）：BYTYPE 请求是周期性的，对象离场后不再回包，
+            超过 `_TABLE_TTL_SECONDS` 未刷新的条目从 `_table` 剔除——
+            否则离场 AI 会残留（每条约 32KB 缓冲区级别的解包字典），
+            且会被反复塞回 traffic_manager 的跟踪表。
+          · 交通源形态推断。返回的 dict 已含 traffic_manager 需要的键；
+            无任何 AI 时返回空列表。
         """
         if not self._available:
             return []
         self.request_once()
         with self._lock:
+            self._evict_stale(time.time())
             snapshot = list(self._table.values())
         self._refresh_source_state(snapshot)
         return [self._to_traffic_dict(v) for v in snapshot]
+
+    def _evict_stale(self, now):
+        """剔除超过老化时间未刷新的 (request_id, object_id) 条目。"""
+        cutoff = now - self._TABLE_TTL_SECONDS
+        stale = [key for key, values in self._table.items()
+                 if values.get("_last_seen", 0.0) < cutoff]
+        for key in stale:
+            del self._table[key]
 
     # ── 形态推断（E11） ──────────────────────────────────────────────────────
 
