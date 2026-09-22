@@ -49,13 +49,15 @@ class LLMClient:
         }
     }
 
-    def __init__(self, config, context, lock, bus, airport_frequency_service=None):
+    def __init__(self, config, context, lock, bus, airport_frequency_service=None,
+                 procedure_service=None):
         self.config = config
         self.context = context
         self.lock = lock
         self.bus = bus
         self.airport_frequency_service = airport_frequency_service
-        
+        # B1：SID/STAR/进近程序源链（None 时退化为纯 LLM 生成）
+        self.procedure_service = procedure_service
         conn_config = config.get('connection', {})
         self.provider = conn_config.get('provider', 'google_genai')
         self.api_key = conn_config.get('api_key', '')
@@ -384,6 +386,10 @@ class LLMClient:
         - SID/Departure: {sid}
         - Cruise: {fp.get('cruise_alt', 'N/A')} FT
         """
+
+        # ── B1: 真实程序块（SID/STAR/进近，带 source）──────────────────────
+        # 有真实程序则逐字使用，否则可生成；source=llm 表示无任何本地数据。
+        procedures_text = self._build_procedures_block(context_copy)
         
         # Weather
         metar = context_copy['environment'].get('metar', 'N/A')
@@ -693,6 +699,8 @@ class LLMClient:
 
         {fp_text}
 
+        {procedures_text}
+
         {freq_text}
 
         {emergency_help}
@@ -743,6 +751,49 @@ class LLMClient:
     import re as _re
 
     @classmethod
+    def _build_procedures_block(self, context_copy) -> str:
+        """B1：SID/STAR/进近真实程序 prompt 块。
+
+        优先使用 logic_manager 已同步的 navigation.procedures（带 source），
+        没有再现查一次。全部源都无数据时返回空（由 LLM 自行生成，不标注来源）。
+        """
+        procs = (context_copy.get('navigation', {}) or {}).get('procedures') or {}
+        if not procs and self.procedure_service:
+            fp = context_copy.get('flight_plan', {}) or {}
+            dep = (fp.get('origin') or '').strip().upper()
+            arr = (fp.get('destination') or '').strip().upper()
+            try:
+                procs = {
+                    "SID": self.procedure_service.get_sids(dep, fp.get('dep_rwy')) if dep and dep != 'N/A' else [],
+                    "STAR": self.procedure_service.get_stars(arr, fp.get('arr_rwy')) if arr and arr != 'N/A' else [],
+                    "APPROACH": self.procedure_service.get_approaches(arr, fp.get('arr_rwy')) if arr and arr != 'N/A' else [],
+                }
+            except Exception as e:
+                print(f"LLMClient: procedure block build failed: {e}")
+                return ""
+
+        sids = procs.get('SID') or []
+        stars = procs.get('STAR') or []
+        approaches = procs.get('APPROACH') or []
+        if not (sids or stars or approaches):
+            return ""
+
+        def _fmt(proc):
+            trans = ", ".join(proc.get('transitions') or []) or "—"
+            return (f"{proc.get('ident')}"
+                    f"{' (RWY ' + str(proc.get('runway')) + ')' if proc.get('runway') else ''}"
+                    f" [transitions: {trans}] (source: {proc.get('source')})")
+
+        lines = ["    " + _fmt(p) for p in sids[:10]]
+        lines += ["    " + _fmt(p) for p in stars[:10]]
+        lines += ["    " + _fmt(p) for p in approaches[:10]]
+        return (
+            "REAL PUBLISHED PROCEDURES (from navigation database — use VERBATIM when one matches the "
+            "flight plan; if none matches you may generate a plausible one):\n"
+            + "\n".join(lines)
+            + "\nNever invent a procedure ident that contradicts an entry above."
+        )
+
     def _classify_complexity(cls, text: str) -> str:
         """
         Return 'thinking' for complex requests that benefit from a reasoning

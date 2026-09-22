@@ -219,6 +219,26 @@
                             <div class="form-text x-small text-muted" data-i18n="ground_data_hint">Choose simulator or
                                 third-party sources for airport frequencies and taxi/apron data.</div>
                         </div>
+                        <div class="mt-2">
+                            <label class="form-label small mb-0" data-i18n="navdb_sqlite_path">LittleNavMap 数据库路径
+                                (navdata.sqlite_path)</label>
+                            <input type="text" class="form-control form-control-sm" id="conf-navdata-sqlite-path"
+                                placeholder="%APPDATA%\ABarthel\little_navmap_db\little_navmap_navigraph.sqlite">
+                            <div class="form-text x-small text-muted">SID/STAR/进近最佳来源。典型路径
+                                <code>%APPDATA%\ABarthel\little_navmap_db\little_navmap_navigraph.sqlite</code>。</div>
+                        </div>
+                        <div class="mt-2">
+                            <label class="form-label small mb-0" data-i18n="procedure_source">程序数据源
+                                (procedure_source)</label>
+                            <select class="form-select form-select-sm" id="conf-procedure-source">
+                                <option value="auto" data-i18n="source_auto">Auto（LNM → CIFP → SimBrief → LLM）</option>
+                                <option value="lnm" data-i18n="source_lnm">LittleNavMap SQLite</option>
+                                <option value="cifp" data-i18n="source_cifp">X-Plane earth_424.dat（仅美国）</option>
+                                <option value="simbrief" data-i18n="source_simbrief">SimBrief OFP</option>
+                                <option value="llm" data-i18n="source_llm">仅 LLM 生成</option>
+                                <option value="off" data-i18n="source_off">关闭</option>
+                            </select>
+                        </div>
 
                         <!-- TTS + STT Voice Engine -->
                         <h6 class="border-bottom pb-1 mb-2 mt-3" data-i18n="voice_engine">🔊 语音引擎（TTS / STT）</h6>
@@ -801,6 +821,8 @@
                 document.getElementById('conf-frequency-source').value = data.navdata?.frequency_source || 'third_party';
                 document.getElementById('conf-ground-source').value = data.navdata?.ground_source || 'simulator';
                 document.getElementById('conf-osm-overpass-url').value = data.navdata?.osm_overpass_url || 'https://overpass-api.de/api/interpreter';
+                document.getElementById('conf-navdata-sqlite-path').value = data.navdata?.sqlite_path || '';
+                document.getElementById('conf-procedure-source').value = data.navdata?.procedure_source || 'auto';
                 document.getElementById('conf-radio-effect').checked = data.audio?.radio_effect ?? false;
                 document.getElementById('conf-stt-path').value = data.audio?.stt_model_path || '';
                 document.getElementById('conf-stt-language').value = data.audio?.stt_language || 'en';
@@ -899,7 +921,9 @@
                     navdata: {
                         frequency_source: document.getElementById('conf-frequency-source').value,
                         ground_source: document.getElementById('conf-ground-source').value,
-                        osm_overpass_url: document.getElementById('conf-osm-overpass-url').value.trim() || 'https://overpass-api.de/api/interpreter'
+                        osm_overpass_url: document.getElementById('conf-osm-overpass-url').value.trim() || 'https://overpass-api.de/api/interpreter',
+                        sqlite_path: document.getElementById('conf-navdata-sqlite-path').value.trim(),
+                        procedure_source: document.getElementById('conf-procedure-source').value
                     },
                     audio: {
                         radio_effect: document.getElementById('conf-radio-effect').checked,

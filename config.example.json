@@ -26,6 +26,13 @@
     "simbrief": {
         "username": ""
     },
+    "navdata": {
+        "frequency_source": "third_party",
+        "ground_source": "simulator",
+        "sqlite_path": "path/to/little_navmap_navigraph.sqlite",
+        "procedure_source": "auto",
+        "osm_overpass_url": "https://overpass-api.de/api/interpreter"
+    },
     "immersion": {
         "busy_level": "medium",
         "bg_chatter": true

@@ -139,6 +139,28 @@ class SimulatorGroundService:
         files.extend(custom_files)
         return files
 
+    def discover_cifp_files(self) -> List[str]:
+        """发现 X-Plane 的 ARINC 424 CIFP 文件（B1）。
+
+        X-Plane 的 CIFP 是单个全量文件 <X-Plane>/Custom Data/earth_424.dat
+        （由 FAA CIFP 重命名放入，见 CIFP-Updater），不是 per-ICAO 文件，
+        且只覆盖美国。Resources/default data/earth_424.dat 作为次选。
+        解析方需按 ICAO 前缀流式过滤。返回按优先级排序的路径列表。
+        """
+        files: List[str] = []
+        sim_config = self.config.get("simulator", {}) or {}
+        explicit = sim_config.get("xplane_cifp_path")
+        if explicit and os.path.exists(explicit):
+            files.append(explicit)
+        root = sim_config.get("xplane_root") or self._detect_xplane_root()
+        if root and os.path.isdir(root):
+            for rel in (("Custom Data", "earth_424.dat"),
+                        ("Resources", "default data", "earth_424.dat")):
+                candidate = os.path.join(root, *rel)
+                if os.path.exists(candidate) and candidate not in files:
+                    files.append(candidate)
+        return files
+
     def _detect_xplane_root(self) -> Optional[str]:
         sim_config = self.config.get("simulator", {}) or {}
         configured_host = sim_config.get("xplane_host")

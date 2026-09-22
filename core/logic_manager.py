@@ -13,6 +13,7 @@ from .atc_session import (ATCSession, PHASE_LABEL_ZH, PHASE_LABEL_JA, enforce_me
 from .china_airspace import is_in_china_airspace, nearest_metric_rvsm_level, metres_to_feet, feet_to_metres
 from .atc_template_responder import ATCTemplateResponder
 from .gate_assigner import assign_gate, compute_occupied_stands
+from .procedure_service import _normalize_ident, _ident_prefix_match
 
 class LogicManager:
     """
@@ -20,11 +21,13 @@ class LogicManager:
     It subscribes to events on the EventBus and emits data to the UI via SocketIO.
     """
     def __init__(self, config, socketio, airport_frequency_service=None, ground_service=None,
-                 atc_session=None):
+                 atc_session=None, procedure_service=None):
         self.config = config
         self.socketio = socketio
         self.airport_frequency_service = airport_frequency_service
         self.ground_service = ground_service
+        # B1：SID/STAR/进近程序源链（LNM → CIFP → SimBrief → LLM 兜底）
+        self.procedure_service = procedure_service
         # 联络顺序 + 跨管制员共享状态的唯一事实来源
         self.atc_session = atc_session or ATCSession(config, airport_frequency_service)
         self.atc_session.attach(shared_context)
@@ -297,6 +300,8 @@ class LogicManager:
         self.workload_sim.busy_level = imm.get('busy_level', 'medium')
         # navdata/traffic 配置变化会影响数据源链，同步给 session/模板 responder
         self.template_responder.airport_frequency_service = self.airport_frequency_service
+        if self.procedure_service:
+            self.procedure_service.config = new_config
 
     def _sync_flight_rules(self):
         """把 shared_context['flight_rules'] 同步进 session（E12：VFR 必须在
@@ -323,6 +328,7 @@ class LogicManager:
     def on_flight_plan_loaded(self, flight_plan):
         self._sync_flight_rules()
         self.atc_session.load_from_flight_plan(flight_plan or {})
+        self._sync_procedures()
         self._emit_phase_update()
         # 先落到 shared_context：_refresh_nearby_airports 的回退分支读的就是这份数据，
         # 不写进去的话飞机没位置时联系不上机场频率库，频率反查会失败。
@@ -389,6 +395,66 @@ class LogicManager:
             self._refresh_ground_context(airports[0]['ident'] if airports else None)
 
         return airports
+
+    def _sync_procedures(self):
+        """B1：把 SID/STAR/进近真实程序写进 navigation.procedures（供 prompt 与
+        PDC 模板使用）。查询结果带 source 字段，无数据时该键为空列表。"""
+        if not self.procedure_service:
+            return
+        with context_lock:
+            fp = dict(shared_context.get('flight_plan', {}))
+        try:
+            dep = (fp.get('origin') or '').strip().upper()
+            arr = (fp.get('destination') or '').strip().upper()
+            dep_rwy = self.atc_session.get('runway') or fp.get('dep_rwy')
+            arr_rwy = self.atc_session.get('arrival_runway') or fp.get('arr_rwy')
+            procs = {"SID": [], "STAR": [], "APPROACH": []}
+            if dep and dep != 'N/A':
+                procs["SID"] = self.procedure_service.get_sids(dep, dep_rwy)
+            if arr and arr != 'N/A':
+                procs["STAR"] = self.procedure_service.get_stars(arr, arr_rwy)
+                procs["APPROACH"] = self.procedure_service.get_approaches(arr, arr_rwy)
+            with context_lock:
+                shared_context['navigation']['procedures'] = procs
+        except Exception as e:
+            print(f"LogicManager: procedure sync failed: {e}")
+
+    def _assign_procedures_from_library(self):
+        """B1：程序库命中且与飞行计划标识一致时，把 SID/STAR 写入权威字段。
+
+        只在飞行计划里有对应 ident 且与本地库模糊匹配（SimBrief 会截断 1 字符）
+        时才写，绝不盲选第一条——否则等于用臆想的程序覆盖放行。
+        """
+        if not self.procedure_service:
+            return
+        with context_lock:
+            fp = dict(shared_context.get('flight_plan', {}))
+        phase = self.atc_session.phase
+        fp_sid = _normalize_ident(fp.get('sid'))
+        fp_star = _normalize_ident(fp.get('star'))
+        try:
+            if phase in ('DISPATCH', 'ATIS', 'CLEARANCE', 'GROUND_DEP', 'TOWER_DEP') \
+                    and fp_sid and fp_sid != 'N/A' and not self.atc_session.get('sid'):
+                airport = (fp.get('origin') or '').strip().upper()
+                runway = self.atc_session.get('runway') or fp.get('dep_rwy')
+                for proc in self.procedure_service.get_sids(airport, runway):
+                    if _ident_prefix_match(fp_sid, proc.get('ident', '')):
+                        self.atc_session.assign('sid', proc['ident'],
+                                                by=f"procedure_service({proc.get('source')})")
+                        print(f"LogicManager: SID 解析 → {proc['ident']} ({proc.get('source')})")
+                        break
+            if phase in ('CENTER', 'APPROACH', 'TOWER_ARR', 'GROUND_ARR', 'PARKED') \
+                    and fp_star and fp_star != 'N/A' and not self.atc_session.get('star'):
+                airport = (fp.get('destination') or '').strip().upper()
+                runway = self.atc_session.get('arrival_runway') or fp.get('arr_rwy')
+                for proc in self.procedure_service.get_stars(airport, runway):
+                    if _ident_prefix_match(fp_star, proc.get('ident', '')):
+                        self.atc_session.assign('star', proc['ident'],
+                                                by=f"procedure_service({proc.get('source')})")
+                        print(f"LogicManager: STAR 解析 → {proc['ident']} ({proc.get('source')})")
+                        break
+        except Exception as e:
+            print(f"LogicManager: procedure assign failed: {e}")
 
     def _assign_gate(self, tuned_role, ctx_snapshot):
         """到达侧停机位分配（A3）：确定性选位 + 预计算进港滑行路由。"""
@@ -1017,6 +1083,7 @@ class LogicManager:
 
     def _on_phase_advanced(self, phase, current_controller):
         """阶段前进一步时，让当前管制员主动发出带频率的移交指令。"""
+        self._sync_procedures()
         contact = self.atc_session.contact_for(phase)
         if not contact or not contact.get('frequency'):
             return
@@ -1156,6 +1223,8 @@ class LogicManager:
 
         # ── Tier 0: DISPATCH/PDC、推出/开车状态、停机位分配 ────────────────────
         self._sync_flight_rules()
+        self._sync_procedures()
+        self._assign_procedures_from_library()
 
         if check['action'] == 'pdc':
             # PDC 仅对 IFR 生效（E12：VFR 不申请预放行）
@@ -1449,6 +1518,9 @@ class LogicManager:
         by = sender or 'ATC'
         phase = self.atc_session.phase
         arrival = self.atc_session.state.get('descending') or phase in ('APPROACH', 'TOWER_ARR')
+
+        # B1：程序库命中时补齐 SID/STAR 权威字段
+        self._assign_procedures_from_library()
 
         # 跑道单独走校验：必须是该机场真实存在的跑道，且不会被悄悄改掉
         requested = extract_runway(raw_text or '')

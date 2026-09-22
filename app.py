@@ -180,6 +180,11 @@ def _normalize_flight_plan(raw_flight_plan):
         "flight_number": _first_non_empty(raw_flight_plan.get('flight_number')).upper() or "N/A",
         # E12：VFR 航班不申请 PDC，DISPATCH 阶段必须能感知飞行规则
         "flight_rules": rules,
+        # B1：SimBrief 程序标识（真实字段名 sid_ident/star_ident/plan_rwy，见 E4）
+        "sid": _first_non_empty(raw_flight_plan.get('sid')).upper(),
+        "star": _first_non_empty(raw_flight_plan.get('star')).upper(),
+        "dep_rwy": _first_non_empty(raw_flight_plan.get('dep_rwy')).upper(),
+        "arr_rwy": _first_non_empty(raw_flight_plan.get('arr_rwy')).upper(),
     }
     route_waypoints = raw_flight_plan.get('route_waypoints')
     if isinstance(route_waypoints, list):
@@ -1319,6 +1324,15 @@ def import_simbrief():
         flight_number = general.get('flight_number', 'N/A')
         airline = general.get('icao_airline', 'N/A')
         callsign = _extract_simbrief_callsign(data)
+        # B1/E4：SimBrief 程序字段真实名是 origin.sid_ident / destination.star_ident /
+        # origin.plan_rwy / destination.plan_rwy（且 ident 可能被截断 1 字符，
+        # procedure_service 侧已做前缀容错）。
+        origin_block = data.get('origin', {}) or {}
+        dest_block = data.get('destination', {}) or {}
+        sid_ident = (origin_block.get('sid_ident') or '').strip()
+        star_ident = (dest_block.get('star_ident') or '').strip()
+        dep_rwy = (origin_block.get('plan_rwy') or '').strip()
+        arr_rwy = (dest_block.get('plan_rwy') or '').strip()
         route_waypoints = []
         navlog_fixes = (data.get('navlog') or {}).get('fix') or []
         if isinstance(navlog_fixes, dict):
@@ -1344,6 +1358,10 @@ def import_simbrief():
             "cruise_alt": cruise_alt,
             "flight_number": f"{airline}{flight_number}",
             "route_waypoints": route_waypoints,
+            "sid": sid_ident,
+            "star": star_ident,
+            "dep_rwy": dep_rwy,
+            "arr_rwy": arr_rwy,
         })
         
         # Update Shared Context
@@ -1361,6 +1379,14 @@ def import_simbrief():
         # Save username to config implicitly
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
+
+        # B1：SimBrief 程序标识进 procedure_service 源链（第三级）
+        proc_svc = globals().get('procedure_service')
+        if proc_svc is not None:
+            try:
+                proc_svc.set_simbrief_plan(flight_plan)
+            except Exception as e:
+                print(f"SimBrief procedure sync failed: {e}")
 
         if callsign and not callsign_locked:
             print(f"SimBrief Callsign Imported: {callsign}")
@@ -1813,11 +1839,15 @@ if __name__ == '__main__':
     # LogicManager、ATCHandoffManager、ATCMonitor、LLM prompt 共用同一个实例，
     # 保证跑道/应答机/频率在所有管制员之间一致。
     from core.atc_session import ATCSession
+    from core.procedure_service import ProcedureService
     atc_session = ATCSession(config, airport_frequency_service)
     atc_session.attach(shared_context)
+    # B1：SID/STAR/进近程序源链（LNM → CIFP → SimBrief → LLM 兜底）
+    procedure_service = ProcedureService(config, ground_service=ground_data_service)
 
     logic_manager = LogicManager(config, socketio, airport_frequency_service=airport_frequency_service,
-                                 ground_service=ground_data_service, atc_session=atc_session)
+                                 ground_service=ground_data_service, atc_session=atc_session,
+                                 procedure_service=procedure_service)
     atc_monitor = ATCMonitor(config, atc_session=atc_session)
     sim_bridge = SimBridge(config, shared_context, context_lock, event_bus)
 
@@ -1845,7 +1875,7 @@ if __name__ == '__main__':
     event_bus.on('telemetry_update', _fwd_telemetry_to_plugins)
     nav_manager = NavManager(config, shared_context, context_lock, event_bus, ground_service=ground_data_service, airport_frequency_service=airport_frequency_service)
     stt_module = STTLocal(config, event_bus)
-    llm_client = LLMClient(config, shared_context, context_lock, event_bus, airport_frequency_service=airport_frequency_service)
+    llm_client = LLMClient(config, shared_context, context_lock, event_bus, airport_frequency_service=airport_frequency_service, procedure_service=procedure_service)
     logic_manager._llm_client = llm_client  # Tier 2 fast-LLM access
     tts_engine = TTSEngine(config, socketio)
     atis_generator = ATISGenerator(config, socketio, airport_frequency_service=airport_frequency_service)
