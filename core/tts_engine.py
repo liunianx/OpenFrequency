@@ -29,6 +29,11 @@ except Exception:
     _PIPER_AVAILABLE = False
 
 class TTSEngine:
+    # ATIS synthesis failures re-emit atis_played, which re-enters speak_atis() in a
+    # brand new thread. Without a cap that is an unbounded retry loop that keeps
+    # spawning threads (one every 5s) as long as the TTS backend stays unreachable.
+    ATIS_MAX_CONSECUTIVE_FAILURES = 6
+
     ENGLISH_VOICE = "en-US-ChristopherNeural"
     JAPANESE_VOICE = "ja-JP-KeitaNeural"
     CHINESE_VOICE = "zh-CN-YunxiNeural"
@@ -90,6 +95,7 @@ class TTSEngine:
         self.ducking_active = False  # When True, suppress background audio
         self._queue_counter = 0  # For stable priority ordering
         self._atis_epoch = 0  # Incremented on each new ATIS request; stale threads bail out
+        self._atis_fail_streak = 0  # Consecutive synthesis failures for the active ATIS
 
         # Subscribe to events
         event_bus.on('tts_request', self.speak)
@@ -587,8 +593,12 @@ class TTSEngine:
                         self._synthesize_audio(chinese_spoken, self.CHINESE_VOICE)
                     )
                     full_audio = english_audio + chinese_audio
+                    if not full_audio:
+                        # Would otherwise fall through to the atis_played emit below and
+                        # re-enter this function with no delay at all.
+                        raise RuntimeError('ATIS synthesis produced no audio')
                     # Bail out if a newer ATIS request arrived while we were synthesizing
-                    if full_audio and self._atis_epoch == my_epoch:
+                    if self._atis_epoch == my_epoch:
                         # Estimate playback duration so atis_played fires after audio ends on client
                         duration_ms = max(1000, int(len(full_audio) / 16000 * 1000))
                         self.socketio.emit('audio_stream', {
@@ -601,16 +611,26 @@ class TTSEngine:
                         _time.sleep(duration_ms / 1000.0)
                 else:
                     if self._atis_epoch == my_epoch:
-                        loop.run_until_complete(self.speak_async(text, icao_override=icao))
+                        sent = loop.run_until_complete(self.speak_async(text, icao_override=icao))
+                        if not sent:
+                            raise RuntimeError('ATIS synthesis produced no audio')
                 loop.close()
                 if icao and self._atis_epoch == my_epoch:
                     event_bus.emit('atis_played', icao)
                     _played = True
+                    self._atis_fail_streak = 0
             except Exception as e:
                 print(f"TTSEngine ATIS Error in thread: {e}")
             finally:
                 # Keep the loop alive even if synthesis failed
                 if not _played and icao and self._atis_epoch == my_epoch:
+                    self._atis_fail_streak += 1
+                    if self._atis_fail_streak >= self.ATIS_MAX_CONSECUTIVE_FAILURES:
+                        print(f"TTSEngine: ATIS synthesis failed {self._atis_fail_streak} times "
+                              f"in a row for {icao}; stopping the ATIS loop.")
+                        self._atis_fail_streak = 0
+                        event_bus.emit('atis_stop')
+                        return
                     import time as _time
                     _time.sleep(5)  # brief pause before retry
                     event_bus.emit('atis_played', icao)
@@ -663,7 +683,9 @@ class TTSEngine:
             print(f"TTSEngine: Guessed region '{icao}' based on Lat/Lon ({lat:.2f}, {lon:.2f})")
 
         voice, text_norm = self._resolve_voice_and_text(text, icao, controller_name, force_mode=force_mode)
-        
+        # Callers rely on this to tell success from a swallowed failure.
+        audio_sent = False
+
         print(f"TTSEngine: [{controller_name}] Using voice '{voice}' -> '{text_norm[:30]}...'")
         
         try:
@@ -671,6 +693,7 @@ class TTSEngine:
                 # Streaming path: emit chunks progressively for lower latency
                 print(f"TTSEngine: [Local/{self._local_engine_name}] Streaming '{text_norm[:40]}...'")
                 await self._stream_synthesize(text_norm, voice)
+                audio_sent = True
             else:
                 # Edge-TTS: full audio then emit once
                 full_audio = await self._synthesize_edge(text_norm, voice)
@@ -684,11 +707,13 @@ class TTSEngine:
                         'data': base64.b64encode(full_audio).decode('utf-8')
                     })
                     print(f"TTSEngine: Sent full audio ({len(full_audio)} bytes) to client.")
+                    audio_sent = True
                 else:
                     print("TTSEngine: Warning - No audio data generated.")
         except Exception as e:
             print(f"Error during TTS generation or streaming: {e}")
-    
+        return audio_sent
+
     # ========== Chatter/Background Audio Support ==========
     
     def _handle_chatter_request(self, data):
