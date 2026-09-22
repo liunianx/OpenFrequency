@@ -8,9 +8,11 @@ from .immersion.workload_sim import WorkloadSimulator
 from .taxi_router import TaxiRouter
 from .instruction_extractor import InstructionExtractor
 from .quick_reply import QuickReplyEngine
-from .atc_session import (ATCSession, PHASE_LABEL_ZH, enforce_message,
+from .atc_session import (ATCSession, PHASE_LABEL_ZH, PHASE_LABEL_JA, enforce_message,
                            extract_clearance_values, extract_runway, role_from_text)
 from .china_airspace import is_in_china_airspace, nearest_metric_rvsm_level, metres_to_feet, feet_to_metres
+from .atc_template_responder import ATCTemplateResponder
+from .gate_assigner import assign_gate, compute_occupied_stands
 
 class LogicManager:
     """
@@ -27,6 +29,7 @@ class LogicManager:
         self.atc_session = atc_session or ATCSession(config, airport_frequency_service)
         self.atc_session.attach(shared_context)
         self.taxi_router = TaxiRouter(ground_service) if ground_service else None
+        self.template_responder = ATCTemplateResponder(airport_frequency_service)
         self.workload_sim = WorkloadSimulator(config)
         self.scheduler = None
         self.last_freq = 0.0
@@ -292,6 +295,18 @@ class LogicManager:
         imm = new_config.get('immersion', {})
         self.workload_sim.auto_busy  = imm.get('auto_busy_level', True)
         self.workload_sim.busy_level = imm.get('busy_level', 'medium')
+        # navdata/traffic 配置变化会影响数据源链，同步给 session/模板 responder
+        self.template_responder.airport_frequency_service = self.airport_frequency_service
+
+    def _sync_flight_rules(self):
+        """把 shared_context['flight_rules'] 同步进 session（E12：VFR 必须在
+        DISPATCH 阶段直接放行到 ATIS，否则 VFR 航班开局卡死）。"""
+        with context_lock:
+            rules = shared_context.get('flight_rules', 'IFR')
+        try:
+            self.atc_session.set_flight_rules(rules)
+        except Exception as e:
+            print(f"LogicManager: flight rules sync failed: {e}")
 
     def _on_traffic_update(self, traffic_list):
         """Keep workload simulator in sync with real nearby aircraft count."""
@@ -306,6 +321,7 @@ class LogicManager:
             })
 
     def on_flight_plan_loaded(self, flight_plan):
+        self._sync_flight_rules()
         self.atc_session.load_from_flight_plan(flight_plan or {})
         self._emit_phase_update()
         # 先落到 shared_context：_refresh_nearby_airports 的回退分支读的就是这份数据，
@@ -374,6 +390,40 @@ class LogicManager:
 
         return airports
 
+    def _assign_gate(self, tuned_role, ctx_snapshot):
+        """到达侧停机位分配（A3）：确定性选位 + 预计算进港滑行路由。"""
+        airport = (ctx_snapshot.get('environment', {}) or {}).get('current_airport') \
+            or (ctx_snapshot.get('environment', {}) or {}).get('nearest_airport') \
+            or self.atc_session.state.get('destination')
+        if not airport or airport == 'N/A' or not self.ground_service:
+            return None
+        try:
+            layout = self.ground_service.get_airport_layout(airport)
+        except Exception as e:
+            print(f"LogicManager: gate assign layout fetch failed: {e}")
+            return None
+        stands = (layout or {}).get('startup_locations') or []
+        if not stands:
+            return None
+        occupied = set()
+        tm = getattr(self, '_traffic_manager', None)
+        if tm is not None:
+            try:
+                with tm.lock:
+                    occupied = compute_occupied_stands(stands, list(tm.aircraft.values()))
+            except Exception as e:
+                print(f"LogicManager: occupancy check skipped: {e}")
+        aircraft_size = 'heavy' if self.config.get('user_profile', {}).get('heavy') else 'medium'
+        gate = assign_gate(stands, aircraft_size=aircraft_size, occupied=occupied)
+        if not gate:
+            return None
+        self.atc_session.assign('assigned_gate', gate['stand'], by=tuned_role or 'ATC')
+        print(f"LogicManager: [Tier 0] 停机位分配 → {gate['stand']} ({gate['reason']})")
+        self._refresh_ground_context(airport)
+        with context_lock:
+            shared_context['atc_state']['session'] = self.atc_session.state
+        return gate
+
     def _refresh_ground_context(self, airport_ident=None):
         if not self.ground_service:
             return None
@@ -435,6 +485,51 @@ class LogicManager:
             'taxi_edge_count': len(layout.get('taxi_edges', [])),
             'suggested_taxi_route': route,
         }
+
+        # ── A2: 推出朝向 / pushback_ok ────────────────────────────────────────
+        # 取距本机最近的 startup_location：apt.dat 源有 heading 可直接定向；
+        # 不在停机位列表内、或距滑行网络过远（无法推出）→ pushback_ok=True，
+        # 允许直接滑行，避免 Tier-0 把跑道边/远距起动位用户永久重定向（G2）。
+        if self.taxi_router and aircraft.get('latitude') is not None:
+            own_stand = self._nearest_stand(layout, aircraft.get('latitude'), aircraft.get('longitude'))
+            if own_stand:
+                direction = self.taxi_router.suggest_pushback_direction(own_stand, airport_ident)
+                if direction:
+                    summary['pushback_direction'] = direction
+                self.atc_session.set_pushback_ok(not direction)
+            else:
+                self.atc_session.set_pushback_ok(True)
+
+        # ── A3: 到达侧停机位 + 进港滑行路由 ───────────────────────────────────
+        phase = self.atc_session.phase
+        assigned_gate = self.atc_session.get('assigned_gate')
+        if phase in ('TOWER_ARR', 'GROUND_ARR') and not assigned_gate and stands:
+            # 落地后自动分配（幂等：assign 后不再重复分配）
+            occupied = set()
+            tm = getattr(self, '_traffic_manager', None)
+            if tm is not None:
+                try:
+                    with tm.lock:
+                        occupied = compute_occupied_stands(stands, list(tm.aircraft.values()))
+                except Exception:
+                    occupied = set()
+            aircraft_size = 'heavy' if self.config.get('user_profile', {}).get('heavy') else 'medium'
+            gate = assign_gate(stands, aircraft_size=aircraft_size, occupied=occupied)
+            if gate:
+                self.atc_session.assign('assigned_gate', gate['stand'], by='ATC')
+                assigned_gate = gate['stand']
+                print(f"LogicManager: 落地自动分配停机位 → {gate['stand']} ({gate['reason']})")
+        if assigned_gate:
+            summary['assigned_gate'] = assigned_gate
+            if self.taxi_router and aircraft.get('latitude') is not None:
+                taxi_in = self.taxi_router.suggest_taxi_in_route(
+                    airport_ident,
+                    {'lat': aircraft.get('latitude'), 'lon': aircraft.get('longitude')},
+                    assigned_gate,
+                )
+                if taxi_in:
+                    summary['suggested_taxi_in_route'] = taxi_in
+
         with context_lock:
             shared_context['navigation']['ground_layout_summary'] = summary
             shared_context['navigation']['current_taxi_path'] = route.get('taxiways', []) if route else []
@@ -457,6 +552,25 @@ class LogicManager:
                     'target_runway': route.get('target_runway') or route.get('end_node', ''),
                 })
         return summary
+
+    @staticmethod
+    def _nearest_stand(layout, lat, lon, max_distance_m=400.0):
+        """距本机最近的 startup_location；超出 max_distance_m 视为不在停机位。"""
+        best = None
+        best_dist = None
+        for stand in (layout or {}).get('startup_locations', []) or []:
+            s_lat, s_lon = stand.get('lat'), stand.get('lon')
+            if s_lat is None or s_lon is None:
+                continue
+            try:
+                dist = TaxiRouter._distance_m(lat, lon, s_lat, s_lon)
+            except Exception:
+                continue
+            if best_dist is None or dist < best_dist:
+                best, best_dist = stand, dist
+        if best is not None and best_dist is not None and best_dist <= max_distance_m:
+            return best
+        return None
 
     def _format_channel_key(self, airport_ident, frequency_mhz, role):
         airport_ident = (airport_ident or 'AREA').strip().upper()
@@ -619,24 +733,29 @@ class LogicManager:
             )
 
     def _determine_controller(self, freq, altitude=None):
-        """Frequency map with emergency, ATIS, and altitude awareness."""
+        """Frequency map with emergency, ATIS, and altitude awareness.
+
+        注意：真实 CD 分布（中国多在 121.6–121.95，欧美多在 118–119）与
+        Ground/Tower 窗重叠，频段法不可靠。只保留 Emergency/ATIS/Ground/Tower
+        四个可靠窗，其余返回 None，由调用方走 _find_frequency_entry 与
+        ROLE_FREQ_FALLBACKS 兜底（E5/A4.2；已删除原先几乎见不到的
+        118.95 < f < 119.0 假 CD 窗）。
+        """
         f = float(freq)
-        
+
         # Issue 6: Emergency frequency
         if 121.4 <= f <= 121.6:
             return "Emergency"
-        
+
         # Issue 7: ATIS frequency range (typically 127-128 MHz)
         if 127.0 <= f <= 128.0:
             return "ATIS"
-        
+
         # Standard frequencies
         if 121.6 <= f <= 121.95:
             return "Ground"
         elif 118.0 <= f <= 118.95:
             return "Tower"
-        elif 118.95 < f < 119.0:
-            return "Clearance Delivery"
         elif 122.8 == f:
             return "Unicom"
         elif 119.0 <= f <= 136.0:
@@ -801,6 +920,7 @@ class LogicManager:
             current_controller = shared_context['atc_state'].get('current_controller', '')
 
             # session 阶段推进是联络顺序的唯一事实来源
+            self._sync_flight_rules()
             advanced_phase = self.atc_session.observe_telemetry(
                 on_ground=on_ground, altitude=alt, vs=vs,
                 groundspeed=ac_data.get('airspeed', 0))
@@ -1034,6 +1154,37 @@ class LogicManager:
                     allow_change=self.atc_session.phase in ('GROUND_DEP', 'TOWER_DEP', 'APPROACH'))
                 print(f"LogicManager: [Tier 0] 跑道申请 {requested} → {display} ({reason})")
 
+        # ── Tier 0: DISPATCH/PDC、推出/开车状态、停机位分配 ────────────────────
+        self._sync_flight_rules()
+
+        if check['action'] == 'pdc':
+            # PDC 仅对 IFR 生效（E12：VFR 不申请预放行）
+            if self.atc_session.state.get('flight_rules', 'IFR') != 'VFR':
+                reply = self.template_responder.respond(
+                    'request_pdc', text, ctx_snapshot)
+                if reply:
+                    self.atc_session.confirm_flight_plan()
+                    if self.atc_session.phase == 'DISPATCH':
+                        self.atc_session.advance_to('ATIS')
+                        with context_lock:
+                            shared_context['atc_state']['session'] = self.atc_session.state
+                        self._emit_phase_update()
+                    print(f"LogicManager: [Tier 0] PDC 批准 → '{reply[:60]}'")
+                    self.on_llm_response(reply, None)
+                    return
+
+        if check['action'] in ('pushback_complete', 'engines_started'):
+            if check['action'] == 'pushback_complete':
+                self.atc_session.mark_pushback_done()
+            else:
+                self.atc_session.mark_engines_started()
+            print(f"LogicManager: [Tier 0] {check['action']} 状态落库")
+            with context_lock:
+                shared_context['atc_state']['session'] = self.atc_session.state
+
+        if check['action'] == 'gate_request':
+            self._assign_gate(tuned_role, ctx_snapshot)
+
         # ── Tier 1: Keyword / template auto-match ───────────────────────────
         # Pure readbacks / roger / wilco → instant canned response, no AI.
         # 带提问的消息不在这里处理，否则"地面频率是多少"会被"复诵正确"吞掉。
@@ -1087,7 +1238,8 @@ class LogicManager:
         airport    = (ctx_snapshot.get('environment', {}).get('current_airport') or
                       ctx_snapshot.get('environment', {}).get('nearest_airport') or 'unknown')
         alt        = ctx_snapshot.get('aircraft', {}).get('altitude', 0)
-        phase      = ctx_snapshot.get('flight', {}).get('phase', 'unknown')
+        # A4.1: shared_context 没有 'flight' 键，phase 恒为 unknown —— 直接读 session
+        phase      = self.atc_session.phase
 
         system_prompt = (
             f"You are {controller} at {airport}. Aircraft callsign: {callsign}. "
@@ -1128,7 +1280,7 @@ class LogicManager:
             atc_state = shared_context.get('atc_state', {})
             raw = (atc_state.get('current_frequency_role')
                    or atc_state.get('current_controller', '') or '')
-        for key in ('Clearance Delivery', 'Ground', 'Tower', 'Departure',
+        for key in ('Clearance Delivery', 'Dispatch', 'Ground', 'Tower', 'Departure',
                     'Approach', 'Center', 'ATIS', 'Unicom', 'Emergency'):
             if key in raw:
                 return key

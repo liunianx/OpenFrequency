@@ -495,6 +495,10 @@ class LLMClient:
             stand_names = ", ".join(ground_summary.get('stand_names', [])[:25]) or "N/A"
             route_names = " -> ".join(suggested.get('taxiways', [])) if suggested.get('taxiways') else "N/A"
             route_target = suggested.get('target_runway') or suggested.get('end_node') or "N/A"
+            # 到达侧（A3）：停机位分配 + 进港滑行路由
+            assigned_gate = ground_summary.get('assigned_gate') or 'N/A'
+            taxi_in = ground_summary.get('suggested_taxi_in_route') or {}
+            taxi_in_names = " -> ".join(taxi_in.get('taxiways', [])) if taxi_in.get('taxiways') else "N/A"
             ground_help = f"""
         GROUND LAYOUT DATA:
         - Source: {ground_summary.get('source', 'simulator')}
@@ -506,6 +510,8 @@ class LLMClient:
         - Suggested route target runway/holding point: {route_target}
         - Suggested route cost: {suggested.get('cost', 'N/A')}
         - Runway crossing count on suggested route: {suggested.get('runway_crossings', 'N/A')}
+        - Assigned gate/stand (arrivals): {assigned_gate}
+        - Suggested taxi-in route to the assigned gate: {taxi_in_names}
 
         GROUND MOVEMENT RULES (CRITICAL):
         - When "Suggested departure taxi route" is NOT N/A, use it VERBATIM — copy the taxiway names exactly as listed.
@@ -514,6 +520,8 @@ class LLMClient:
         - If the suggested route is N/A, say "taxi to holding point, follow marshaller / follow signage" — do NOT guess a route.
         - Do NOT mention internal node IDs; say only taxiway names, holding point, and runway number.
         - Runway crossings: tell pilot to "cross runway XX" explicitly for each runway on route.
+        - ARRIVALS: when "Assigned gate/stand" is NOT N/A, every taxi instruction MUST terminate at that gate,
+          and MUST use the suggested taxi-in route above when it is not N/A.
         """
         
         # ── China Metric RVSM block ───────────────────────────────────────────

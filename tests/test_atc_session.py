@@ -87,11 +87,54 @@ class RunwayNormalizationTests(unittest.TestCase):
 class SequenceTests(unittest.TestCase):
     """问题 1：起飞联络必须从签派开始。"""
 
+    def test_ifr_starts_at_dispatch_and_pdc_advances(self):
+        # IFR 初态为 DISPATCH；PDC 复诵确认（fpl_confirmed）后经遥测推进到 ATIS
+        session = make_session()
+        self.assertEqual(session.phase, "DISPATCH")
+        nxt = session.next_contact()
+        self.assertEqual(nxt["role"], "ATIS")
+        session.confirm_flight_plan()
+        self.assertEqual(
+            session.observe_telemetry(on_ground=True, altitude=0, vs=0, groundspeed=0),
+            "ATIS")
+        session.mark_atis_copied()
+        self.assertEqual(
+            session.observe_telemetry(on_ground=True, altitude=0, vs=0, groundspeed=0),
+            "CLEARANCE")
+        contact = session.contact_for("CLEARANCE")
+        self.assertEqual(contact["role"], "Clearance Delivery")
+        self.assertEqual(contact["frequency"], "121.950")
+
+    def test_vfr_never_starts_at_dispatch(self):
+        # E12：VFR/通航不申请 PDC，初态直接 ATIS，且切换 VFR 也不会卡在 DISPATCH
+        session = ATCSession(config={}, airport_frequency_service=FakeFreqService())
+        session.attach({})
+        session.load_from_flight_plan({"origin": "ZGGG", "destination": "VHHH",
+                                       "flight_rules": "VFR"}, callsign="G-NXWB")
+        self.assertEqual(session.phase, "ATIS")
+        self.assertEqual(
+            session.observe_telemetry(on_ground=True, altitude=0, vs=0, groundspeed=0),
+            None)  # 没抄 ATIS 之前停在 ATIS，不会回 DISPATCH
+        # 先按 IFR 建 session 再切 VFR：DISPATCH 必须直接放行到 ATIS
+        session2 = make_session()
+        session2.set_flight_rules("VFR")
+        self.assertEqual(session2.phase, "ATIS")
+
+    def test_dispatch_not_reachable_by_tuning(self):
+        # E13：tune 到 CD 频率只能对齐 CLEARANCE，不会命中 DISPATCH
+        session = make_session()
+        session.observe_tuning("Clearance Delivery")
+        self.assertEqual(session.phase, "CLEARANCE")
+
     def test_first_contact_is_clearance_delivery(self):
         session = make_session()
-        nxt = session.next_contact()
-        self.assertEqual(nxt["role"], "Clearance Delivery")
-        self.assertEqual(nxt["frequency"], "121.950")
+        session.confirm_flight_plan()
+        session.observe_telemetry(on_ground=True, altitude=0, vs=0, groundspeed=0)
+        session.mark_atis_copied()
+        session.observe_telemetry(on_ground=True, altitude=0, vs=0, groundspeed=0)
+        contact = session.contact_for("CLEARANCE")
+        self.assertEqual(contact["role"], "Clearance Delivery")
+        self.assertEqual(contact["frequency"], "121.950")
 
     def test_tower_cannot_issue_clearance(self):
         session = make_session()
@@ -142,6 +185,65 @@ class SequenceTests(unittest.TestCase):
         self.assertEqual(session.phase, "TOWER_DEP")
         session.observe_tuning("Clearance Delivery")
         self.assertEqual(session.phase, "CLEARANCE")
+
+
+class PushbackAndGateTests(unittest.TestCase):
+    """A2/A3：推出前置条件化、停机位与进港滑行意图。"""
+
+    def test_taxi_blocked_without_pushback(self):
+        session = make_session("GROUND_DEP")
+        result = session.check_request("申请滑行到跑道外等待", tuned_role="Ground")
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "missing_pushback")
+        # 重定向到地面台（不是放行台），避免死循环劝退
+        self.assertEqual(result["redirect"]["role"], "Ground")
+
+    def test_taxi_allowed_after_pushback_done(self):
+        session = make_session("GROUND_DEP")
+        session.propose_runway("20R", by="白云放行")
+        session.mark_pushback_done()
+        self.assertTrue(session.check_request("申请滑行", tuned_role="Ground")["allowed"])
+
+    def test_taxi_allowed_when_pushback_ok(self):
+        # 站立机位可直接滑出（远距起动位/跑道边）：pushback_ok 放开前置
+        session = make_session("GROUND_DEP")
+        session.propose_runway("20R", by="白云放行")
+        session.set_pushback_ok(True)
+        self.assertTrue(session.check_request("申请滑行", tuned_role="Ground")["allowed"])
+
+    def test_pushback_complete_intent_detected(self):
+        self.assertEqual(detect_intent("推出完成，申请滑行"), "pushback_complete")
+        self.assertEqual(detect_intent("pushback complete, ready for taxi"), "pushback_complete")
+        self.assertEqual(detect_intent("engines started"), "engines_started")
+
+    def test_gate_intents_detected(self):
+        self.assertEqual(detect_intent("申请停机位"), "gate_request")
+        self.assertEqual(detect_intent("滑行到停机位"), "taxi_to_gate")
+        # taxi_to_gate 必须排在 taxi 之前，否则"滑行到停机位"被 taxi 吞掉
+        self.assertEqual(detect_intent("请求滑行到停机位19"), "taxi_to_gate")
+
+    def test_gate_request_redirected_to_ground_arrival(self):
+        session = make_session("TOWER_ARR")
+        session.propose_runway("07L", by="香港进近", arrival=True)
+        result = session.check_request("申请停机位", tuned_role="Tower")
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["redirect"]["role"], "Ground")
+
+    def test_pdc_intent_detected(self):
+        self.assertEqual(detect_intent("申请预放行"), "pdc")
+        self.assertEqual(detect_intent("request PDC"), "pdc")
+        # PDC 必须排在 ifr_clearance 之前，不能被"申请放行"抢先
+        self.assertEqual(detect_intent("请求预放行许可"), "pdc")
+
+    def test_star_is_sticky_but_approach_is_not(self):
+        # E1：star 一经放行不再变；approach_clearance 保持可覆盖
+        session = make_session("CLEARANCE")
+        self.assertTrue(session.assign("star", "VYKOS1A", by="广州放行"))
+        self.assertFalse(session.assign("star", "ANDOS1A", by="广州塔台"))
+        self.assertEqual(session.get("star"), "VYKOS1A")
+        self.assertTrue(session.assign("approach_clearance", "ILS 07L", by="香港进近"))
+        self.assertTrue(session.assign("approach_clearance", "RNAV 07L", by="香港进近"))
+        self.assertEqual(session.get("approach_clearance"), "RNAV 07L")
 
 
 class NextContactTests(unittest.TestCase):

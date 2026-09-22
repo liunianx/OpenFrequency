@@ -941,8 +941,10 @@
             let marker = '';
             if (step.state === 'current') { cls = 'btn-primary'; marker = '▶ '; }
             else if (step.state === 'done') { cls = 'btn-success'; marker = '✓ '; }
-            const zh = (localStorage.getItem('language') || 'en') === 'zh';
-            const label = zh ? (step.label_zh || step.label_en) : (step.label_en || step.label_zh);
+            const lang = localStorage.getItem('language') || 'en';
+            const label = lang === 'zh' ? (step.label_zh || step.label_en)
+                         : lang === 'ja' ? (step.label_ja || step.label_en)
+                         : (step.label_en || step.label_zh);
             return `<button type="button" class="btn btn-sm ${cls} seq-step" data-freq="${freq}"
                         title="${label} ${freq}" ${step.frequency ? '' : 'disabled'}>${marker}${label} ${freq}</button>`;
         }).join('');

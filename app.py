@@ -1,4 +1,4 @@
-﻿import multiprocessing
+import multiprocessing
 multiprocessing.freeze_support()  # Must be called early for PyInstaller + Windows spawn
 
 import json
@@ -168,13 +168,18 @@ def _extract_simbrief_callsign(data):
 def _normalize_flight_plan(raw_flight_plan):
     """Normalize a flight plan payload/config block into the runtime shape."""
     raw_flight_plan = raw_flight_plan or {}
+    rules = str(raw_flight_plan.get('flight_rules') or 'IFR').upper()
+    if rules not in ('IFR', 'VFR'):
+        rules = 'IFR'
     plan = {
         "origin": _first_non_empty(raw_flight_plan.get('origin')).upper() or "N/A",
         "destination": _first_non_empty(raw_flight_plan.get('destination')).upper() or "N/A",
         "alternate": _first_non_empty(raw_flight_plan.get('alternate')).upper() or "N/A",
         "route": _first_non_empty(raw_flight_plan.get('route')) or "N/A",
         "cruise_alt": int(raw_flight_plan.get('cruise_alt', 0) or 0),
-        "flight_number": _first_non_empty(raw_flight_plan.get('flight_number')).upper() or "N/A"
+        "flight_number": _first_non_empty(raw_flight_plan.get('flight_number')).upper() or "N/A",
+        # E12：VFR 航班不申请 PDC，DISPATCH 阶段必须能感知飞行规则
+        "flight_rules": rules,
     }
     route_waypoints = raw_flight_plan.get('route_waypoints')
     if isinstance(route_waypoints, list):

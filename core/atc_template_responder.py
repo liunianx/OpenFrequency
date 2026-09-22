@@ -43,8 +43,29 @@ class ATCTemplateResponder:
             runway = self._preferred_runway(current_airport)
             return f"{callsign}, cleared to {destination} via {sid}, runway {runway}, squawk {squawk}."
 
+        if intent == "request_pdc":
+            # PDC（预放行）经 ACARS/CPDLC 数据链递交。SID 优先取 B1 程序解析结果
+            # （shared_context['navigation']['procedures']['sid']），缺失才退回 route。
+            destination = flight_plan.get("destination", "N/A")
+            route = flight_plan.get("route", "N/A")
+            nav = (context or {}).get("navigation", {}) or {}
+            procedures = nav.get("procedures") or {}
+            sid = (procedures.get("sid")
+                   or (route.split()[0] if route and route != "N/A" else "flight planned route"))
+            runway = self._preferred_runway(current_airport)
+            squawk = self._squawk_for_callsign(callsign)
+            cruise_alt = flight_plan.get("cruise_alt") or "flight planned altitude"
+            return (
+                f"{callsign}, predeparture clearance approved: cleared to {destination} "
+                f"via {sid}, runway {runway}, initial climb {cruise_alt} ft, squawk {squawk}. "
+                f"Read back the PDC and contact ATIS."
+            )
+
         if intent == "request_pushback" and "Ground" in role:
-            return f"{callsign}, pushback approved, face west."
+            direction = self._pushback_direction(context, ground_summary)
+            if direction:
+                return f"{callsign}, pushback approved, face {direction}."
+            return f"{callsign}, pushback approved."
 
         if intent == "request_taxi" and "Ground" in role:
             runway = self._preferred_runway(current_airport)
@@ -88,6 +109,15 @@ class ATCTemplateResponder:
             return "N/A"
         runways = self.airport_frequency_service.get_preferred_runways(airport_ident, limit=1)
         return runways[0] if runways else "N/A"
+
+    def _pushback_direction(self, context, ground_summary):
+        """从 ground_summary 取 logic_manager 预算好的推出朝向（taxi_router 计算）。
+        拿不到时不编方向——删除原来硬编码的 face west。"""
+        summary = ground_summary or {}
+        direction = summary.get("pushback_direction")
+        if direction:
+            return direction
+        return (context or {}).get("navigation", {}).get("pushback_direction")
 
     def _frequency_for(self, airport_ident, role):
         if not self.airport_frequency_service:

@@ -3,6 +3,22 @@ import math
 
 import networkx as nx
 
+# stand 节点接入滑行网络的最近 taxi_node 距离阈值（米），与
+# osm_ground_service._attach_parking_to_taxi_network 保持一致
+STAND_ATTACH_MAX_M = 120.0
+
+_COMPASS_8 = ["north", "north-east", "east", "south-east",
+              "south", "south-west", "west", "north-west"]
+
+
+def _compass_point(bearing_deg) -> str:
+    """把角度（度，0=北）转成八点罗盘文字，用于 pushback 朝向指令。"""
+    try:
+        deg = float(bearing_deg) % 360.0
+    except (TypeError, ValueError):
+        return "north"
+    return _COMPASS_8[int((deg + 22.5) // 45.0) % 8]
+
 
 class TaxiRouter:
     def __init__(self, ground_service):
@@ -71,6 +87,7 @@ class TaxiRouter:
                 runway_crossing=(kind == "runway"),
             )
 
+        self._attach_stands()
         self._mark_hotspots()
         print(
             f"TaxiRouter: Loaded {self.graph.number_of_nodes()} nodes and "
@@ -234,6 +251,139 @@ class TaxiRouter:
         delta = abs((bearing2 - bearing1 + 180.0) % 360.0 - 180.0)
         return delta * 4.0
 
+    def _attach_stands(self):
+        """把停机位作为 stand:{gate_id} 节点接入滑行图（G3）。
+
+        apt.dat 源的 startup_locations 只是元数据、stand 不是图节点；
+        OSM 源在 osm_ground_service._attach_parking_to_taxi_network 里已显式建
+        stand 节点。所有源统一走这里，suggest_taxi_in_route 才有稳定终点。
+        最近 taxi_node 超过 STAND_ATTACH_MAX_M 的 stand 不连线（视为不可滑入）。
+        """
+        if not self.layout:
+            return
+        taxi_nodes = [n for n in self.graph.nodes]
+        for stand in self.layout.get("startup_locations", []) or []:
+            lat, lon = stand.get("lat"), stand.get("lon")
+            if lat is None or lon is None:
+                continue
+            gate_id = (stand.get("gate_id") or stand.get("name") or "").strip()
+            if not gate_id:
+                continue
+            stand_id = f"stand:{gate_id}"
+            if stand_id not in self.graph.nodes:
+                self.graph.add_node(
+                    stand_id, lat=lat, lon=lon, usage="gate",
+                    hotspot=False, stand_name=gate_id,
+                )
+            if not taxi_nodes:
+                continue
+            nearest = min(
+                taxi_nodes,
+                key=lambda node_id: self._distance_m(
+                    lat, lon,
+                    self.graph.nodes[node_id].get("lat"),
+                    self.graph.nodes[node_id].get("lon"),
+                ),
+            )
+            if self._distance_m(lat, lon,
+                                self.graph.nodes[nearest].get("lat"),
+                                self.graph.nodes[nearest].get("lon")) <= STAND_ATTACH_MAX_M:
+                self.graph.add_edge(
+                    stand_id, nearest,
+                    distance_m=self._distance_m(
+                        lat, lon,
+                        self.graph.nodes[nearest].get("lat"),
+                        self.graph.nodes[nearest].get("lon"),
+                    ),
+                    direction="twoway",
+                    kind="apron_link",
+                    name=gate_id,
+                    width_m=18.0,
+                    surface="paved",
+                    runway_names=set(),
+                    runway_crossing=False,
+                )
+
+    def suggest_taxi_in_route(self, airport_icao, aircraft_position, stand_ident):
+        """进港滑行：跑道邻接节点 → 指定停机位（A3）。
+
+        起点取距飞机最近的 runway 邻接节点（runway_links>0，复用 _mark_hotspots 的
+        判定，不另写几何算法）；终点为 stand:{stand_ident}。返回结构与
+        suggest_taxi_route 对齐。
+        """
+        if airport_icao != self.airport_icao or self.graph.number_of_nodes() == 0:
+            self.build_graph_for_airport(airport_icao)
+        if self.graph.number_of_nodes() == 0:
+            return None
+
+        stand_id = f"stand:{stand_ident}" if stand_ident else None
+        if not stand_id or stand_id not in self.graph:
+            return None
+
+        pos = aircraft_position or {}
+        if pos.get("lat") is None or pos.get("lon") is None:
+            return None
+
+        runway_nodes = [node_id for node_id, data in self.graph.nodes(data=True)
+                        if data.get("runway_links", 0) > 0]
+        if not runway_nodes:
+            return None
+        start_node = min(
+            runway_nodes,
+            key=lambda node_id: self._distance_m(
+                pos["lat"], pos["lon"],
+                self.graph.nodes[node_id].get("lat"),
+                self.graph.nodes[node_id].get("lon"),
+            ),
+        )
+
+        route = self.find_path(start_node, stand_id)
+        if not route:
+            return None
+
+        taxiways = []
+        runway_crossings = 0
+        for start_id, end_id in zip(route["path"], route["path"][1:]):
+            edge = self.graph.edges[start_id, end_id]
+            name = edge.get("name", "")
+            if edge.get("runway_crossing"):
+                runway_crossings += 1
+            if name and name not in taxiways and edge.get("kind") != "runway":
+                taxiways.append(name)
+
+        return {
+            "path": route["path"],
+            "taxiways": taxiways,
+            "cost": round(route["cost"], 1),
+            "runway_crossings": runway_crossings,
+            "end_node": stand_id,
+            "stand": stand_ident,
+        }
+
+    def suggest_pushback_direction(self, stand, airport_icao=None):
+        """推出朝向（A2）：优先用停机位 heading（apt.dat 1300 行有），
+        OSM 源没有朝向时退化为最近滑行道边的方向。返回 'west' / 'north-east' 等，
+        取不到返回 None。"""
+        stand = stand or {}
+        heading = stand.get("heading")
+        if heading not in (None, "", 0, 0.0):
+            return _compass_point(heading)
+        lat, lon = stand.get("lat"), stand.get("lon")
+        if lat is None or lon is None:
+            return None
+        if airport_icao and (airport_icao != self.airport_icao or self.graph.number_of_nodes() == 0):
+            self.build_graph_for_airport(airport_icao)
+        if self.graph.number_of_nodes() == 0:
+            return None
+        nearest = self.find_nearest_node(lat, lon)
+        if not nearest:
+            return None
+        node = self.graph.nodes[nearest]
+        if node.get("lat") is None or node.get("lon") is None:
+            return None
+        # 退化方向：停机位指向最近滑行道节点的方位
+        return _compass_point(self._bearing(lat, lon, node["lat"], node["lon"]))
+
     def _mark_hotspots(self):
         for node_id in self.graph.nodes:
             degree = self.graph.degree(node_id)
@@ -242,6 +392,7 @@ class TaxiRouter:
                 edge = self.graph.edges[node_id, neighbor]
                 if edge.get("kind") == "runway":
                     runway_links += 1
+            self.graph.nodes[node_id]["runway_links"] = runway_links
             self.graph.nodes[node_id]["hotspot"] = degree >= 4 or runway_links > 0
 
     @staticmethod

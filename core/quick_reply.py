@@ -182,7 +182,7 @@ class QuickReplyEngine:
         'Beijing Approach' → 'Approach'
         """
         for key in ['Ground', 'Tower', 'Approach', 'Departure', 'Center',
-                    'Clearance Delivery', 'Unicom', 'Emergency']:
+                    'Clearance Delivery', 'Dispatch', 'Unicom', 'Emergency']:
             if key in full_role:
                 return key
         return full_role

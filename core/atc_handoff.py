@@ -23,6 +23,7 @@ from .context import shared_context, event_bus
 
 class ATCPhase(Enum):
     """ATC 阶段枚举（与 ATCSession.PHASES 保持一致）"""
+    DISPATCH = "DISPATCH"         # 签派（PDC 数据链预放行）
     ATIS = "ATIS"               # 抄收 ATIS
     CLEARANCE = "CLEARANCE"     # 放行
     GROUND_DEP = "GROUND_DEP"   # 地面/机坪 (出发)
@@ -132,17 +133,9 @@ class ATCHandoffManager:
         event_bus.emit('atis_playback_request', icao)
 
     def _broadcast_phase_change(self):
-        """广播当前阶段到前端"""
-        phase = self.session.phase
-        self.socketio.emit('atc_phase_update', {
-            'phase': phase,
-            'phase_label': PHASE_LABEL_ZH.get(phase, phase),
-            'controller': self.session.phase_role(),
-            'next_contact': self.session.next_contact(),
-            'sequence': self.session.sequence_for_ui(),
-            'origin': self.origin_icao,
-            'destination': self.dest_icao,
-        })
+        """同步镜像阶段。socket 广播统一由 LogicManager._emit_phase_update 负责
+        （A4.3：修复 atc_handoff 与 logic_manager 双份 atc_phase_update emit）。"""
+        self._sync_mirror()
 
     def on_atis_played(self, icao):
         """ATIS 播放完成"""

@@ -23,15 +23,18 @@ import threading
 import time
 
 # ── 阶段梯 ───────────────────────────────────────────────────────────────────
-# 起飞: ATIS → 放行 → 地面 → 塔台 → 离场 → 中心
+# 起飞: 签派(PDC数据链) → ATIS → 放行 → 地面 → 塔台 → 离场 → 中心
 # 降落: 中心 → 进近 → 塔台 → 地面 → 停机
+# DISPATCH 只对 IFR 有意义（VFR 不申请预放行，初态直接是 ATIS，见 E12 修正）；
+# DISPATCH 不参与调频反查（E13），只由 fpl_confirmed（PDC 复诵/WILCO）推进。
 PHASES = [
-    "ATIS", "CLEARANCE", "GROUND_DEP", "TOWER_DEP", "DEPARTURE",
+    "DISPATCH", "ATIS", "CLEARANCE", "GROUND_DEP", "TOWER_DEP", "DEPARTURE",
     "CENTER", "APPROACH", "TOWER_ARR", "GROUND_ARR", "PARKED",
 ]
 
 # 每个阶段对应的管制角色键（与 airport_frequency_service 的 role 一致）
 PHASE_ROLE = {
+    "DISPATCH": "Dispatch",
     "ATIS": "ATIS",
     "CLEARANCE": "Clearance Delivery",
     "GROUND_DEP": "Ground",
@@ -45,21 +48,30 @@ PHASE_ROLE = {
 }
 
 PHASE_LABEL_ZH = {
-    "ATIS": "通波", "CLEARANCE": "放行", "GROUND_DEP": "地面",
+    "DISPATCH": "签派", "ATIS": "通波", "CLEARANCE": "放行", "GROUND_DEP": "地面",
     "TOWER_DEP": "塔台", "DEPARTURE": "离场", "CENTER": "区域",
     "APPROACH": "进近", "TOWER_ARR": "塔台", "GROUND_ARR": "地面",
     "PARKED": "停机",
 }
 
 PHASE_LABEL_EN = {
-    "ATIS": "ATIS", "CLEARANCE": "Clearance Delivery", "GROUND_DEP": "Ground",
+    "DISPATCH": "Dispatch", "ATIS": "ATIS", "CLEARANCE": "Clearance Delivery",
+    "GROUND_DEP": "Ground",
     "TOWER_DEP": "Tower", "DEPARTURE": "Departure", "CENTER": "Center",
     "APPROACH": "Approach", "TOWER_ARR": "Tower", "GROUND_ARR": "Ground",
     "PARKED": "Parked",
 }
 
+PHASE_LABEL_JA = {
+    "DISPATCH": "ディスパッチ", "ATIS": "ATIS", "CLEARANCE": "クリアランス",
+    "GROUND_DEP": "グランド",
+    "TOWER_DEP": "タワー", "DEPARTURE": "デパーチャー", "CENTER": "センター",
+    "APPROACH": "アプローチ", "TOWER_ARR": "タワー", "GROUND_ARR": "グランド",
+    "PARKED": "駐機場",
+}
+
 ROLE_LABEL_ZH = {
-    "ATIS": "通波", "Clearance Delivery": "放行", "Ground": "地面",
+    "ATIS": "通波", "Dispatch": "签派", "Clearance Delivery": "放行", "Ground": "地面",
     "Tower": "塔台", "Departure": "离场", "Center": "区域",
     "Approach": "进近", "Unicom": "Unicom", "Emergency": "紧急",
 }
@@ -68,8 +80,10 @@ ROLE_LABEL_ZH = {
 _ARRIVAL_PHASES = {"APPROACH", "TOWER_ARR", "GROUND_ARR"}
 
 # 每个角色查频率时的回退链：数据库缺该角色时依次尝试
+# Dispatch 显示 CD 频率仅供 UI（PDC 实际走 ACARS/CPDLC 数据链，不占用语音频率，见 E13）
 ROLE_FREQ_FALLBACKS = {
     "ATIS": ("ATIS",),
+    "Dispatch": ("Clearance Delivery",),
     "Clearance Delivery": ("Clearance Delivery", "Ground"),
     "Ground": ("Ground",),
     "Tower": ("Tower",),
@@ -80,6 +94,7 @@ ROLE_FREQ_FALLBACKS = {
 
 # 每个阶段允许下发的指令
 PHASE_AUTHORITY = {
+    "DISPATCH": {"pdc", "flightplan_confirm"},
     "ATIS": set(),
     "CLEARANCE": {"ifr_clearance"},
     "GROUND_DEP": {"pushback", "taxi", "runway_crossing"},
@@ -88,15 +103,20 @@ PHASE_AUTHORITY = {
     "CENTER": {"vectors", "climb", "descent"},
     "APPROACH": {"vectors", "climb", "descent", "approach_clearance"},
     "TOWER_ARR": {"landing"},
-    "GROUND_ARR": {"taxi"},
+    "GROUND_ARR": {"taxi", "gate_assignment", "taxi_to_gate"},
     "PARKED": set(),
 }
 
 # 意图 → 拥有该指令的阶段
 ACTION_OWNER = {
+    "pdc": "DISPATCH",
+    "flightplan_confirm": "DISPATCH",
     "ifr_clearance": "CLEARANCE",
     "pushback": "GROUND_DEP",
     "taxi": "GROUND_DEP",
+    "gate_request": "GROUND_ARR",
+    "gate_assignment": "GROUND_ARR",
+    "taxi_to_gate": "GROUND_ARR",
     "runway_crossing": "GROUND_DEP",
     "lineup": "TOWER_DEP",
     "takeoff": "TOWER_DEP",
@@ -108,15 +128,36 @@ ACTION_OWNER = {
     "landing": "TOWER_ARR",
 }
 
-# 某些指令要求前置条件已经成立（否则说明飞行员跳过了签派）
+# 某些指令要求前置条件已经成立（否则说明飞行员跳过了签派/没推出）。
+# 值可以是字段名（str）或 callable(session)->bool：返回 True 表示前置未满足。
+# callable 用于表达"站立机位可直接滑出时例外"（G2），静态 tuple 表达不了。
+# 前置缺失时的重定向目标：默认 CLEARANCE；taxi 缺推出时target GROUND_DEP。
 ACTION_PREREQS = {
     "lineup": ("runway",),
     "takeoff": ("runway", "squawk"),
     "landing": ("runway",),
+    # pushback_done/pushback_ok 存在 state 里而不是 assigned，用 s.state 读
+    "taxi": (lambda s: not (s.state.get("pushback_done") or s.state.get("pushback_ok")),),
 }
 
-# 意图识别（中英双语）
+# 前置条件缺失时应该把飞行员送去哪个阶段（不在此表中的一律回 CLEARANCE）
+PREREQ_REDIRECT = {
+    "taxi": "GROUND_DEP",
+}
+
+# 意图识别（中英双语）。顺序即优先级：PDC/停机位/推出完成必须排在泛化意图之前。
 _INTENT_PATTERNS = [
+    ("pdc", (r"申请.{0,4}预放行", r"请求.{0,4}预放行", r"predeparture clearance",
+             r"request pdc", r"\bpdc\b", r"clearance on request")),
+    ("flightplan_confirm", (r"复诵.{0,4}预放行", r"预放行.{0,4}(?:确认|复诵)",
+                            r"w?ilco", r"flight ?plan (?:is )?confirmed")),
+    ("gate_request", (r"申请停机位", r"请求停机位", r"分配停机位", r"申请廊桥",
+                      r"request gate", r"gate assignment")),
+    ("taxi_to_gate", (r"滑行到停机位", r"滑行至停机位", r"滑行到廊桥",
+                      r"taxi to (?:the )?(?:gate|stand)")),
+    ("pushback_complete", (r"推出完成", r"推出完毕", r"pushback complete")),
+    ("engines_started", (r"启动完成", r"开车完成", r"发动机启动完成",
+                         r"engines? (?:are )?started")),
     ("takeoff", (r"申请.{0,6}起飞", r"请求.{0,6}起飞", r"准备起飞", r"可以起飞", r"ready for (?:takeoff|departure)",
                  r"cleared for takeoff", r"request takeoff")),
     ("runway_request", (r"申请使用?跑道", r"请求使用?跑道", r"使用跑道", r"换跑道", r"改跑道",
@@ -140,6 +181,7 @@ _COMPILED_INTENTS = [(name, tuple(re.compile(p, re.I) for p in pats)) for name, 
 
 # 角色名识别（用于解析"联系离场 120.4"这类句子里的角色）
 ROLE_TEXT_ALIASES = [
+    ("Dispatch", ("签派", "dispatch")),
     ("Clearance Delivery", ("放行", "clearance delivery", "clearance", "delivery")),
     ("Ground", ("地面", "ground")),
     ("Tower", ("塔台", "tower")),
@@ -162,7 +204,9 @@ NON_ATC_ROLES = {"Unicom", "Emergency", "ATC"}
 _ARRIVAL_START = PHASES.index("APPROACH")
 
 # 一次性指定后不再变动的字段（first-write-wins），其余字段后者覆盖前者
-STICKY_FIELDS = {"callsign", "squawk", "runway", "arrival_runway", "sid", "cruise_alt"}
+# star: SID/STAR 一经放行不再变；approach_clearance 故意不在此列——进近许可会
+# 合法变更（改跑道、复飞后重新指定），设 sticky 会让第二次进近许可被 assign 静默拒绝。
+STICKY_FIELDS = {"callsign", "squawk", "runway", "arrival_runway", "sid", "star", "cruise_alt"}
 
 _CN_NUM = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
@@ -319,14 +363,23 @@ def detect_intent(text) -> str | None:
     return None
 
 
-def _new_state() -> dict:
+def _new_state(flight_rules: str = "IFR") -> dict:
+    rules = "VFR" if str(flight_rules).upper() == "VFR" else "IFR"
     return {
-        "phase": "ATIS",
+        # E12: VFR/通航航班不申请 PDC，初态直接 ATIS，绝不卡在 DISPATCH
+        "phase": "ATIS" if rules == "VFR" else "DISPATCH",
+        "flight_rules": rules,
         "origin": None,
         "destination": None,
         "cruise_alt": 0,
         "atis_letter": None,
         "atis_copied": False,
+        # PDC（预放行）复诵/WILCO 确认；DISPATCH→ATIS 只由它（或 VFR）触发（E12/E13）
+        "fpl_confirmed": False,
+        # 推出/开车状态（A2）；pushback_ok=True 表示站立机位可直接滑出，无需推出
+        "pushback_done": False,
+        "engines_started": False,
+        "pushback_ok": False,
         "descending": False,
         "airborne": False,
         "tuned_role": None,
@@ -347,6 +400,7 @@ class ATCSession:
         ("runway", "Departure runway", "起飞跑道"),
         ("arrival_runway", "Landing runway", "落地跑道"),
         ("sid", "SID", "离场程序"),
+        ("star", "STAR", "进场程序"),
         ("cruise_alt", "Cruise altitude", "巡航高度"),
         ("cleared_altitude", "Cleared altitude", "许可高度"),
         ("assigned_heading", "Assigned heading", "许可航向"),
@@ -354,6 +408,7 @@ class ATCSession:
         ("altimeter", "Altimeter", "修正海压"),
         ("taxi_route", "Taxi route", "滑行路线"),
         ("approach_clearance", "Approach", "进近方式"),
+        ("assigned_gate", "Gate", "停机位"),
         ("hold_short_runway", "Hold short", "等待点"),
     ]
 
@@ -371,6 +426,12 @@ class ATCSession:
             if isinstance(state, dict) and state:
                 self._state.clear()
                 self._state.update(state)
+                # 兼容旧快照：缺新字段时补默认值
+                self._state.setdefault("flight_rules", "IFR")
+                self._state.setdefault("fpl_confirmed", False)
+                self._state.setdefault("pushback_done", False)
+                self._state.setdefault("engines_started", False)
+                self._state.setdefault("pushback_ok", False)
 
     def attach(self, context: dict) -> None:
         """把状态挂到 shared_context 上，让所有模块看到同一份数据。"""
@@ -388,8 +449,9 @@ class ATCSession:
     def reset(self, flight_plan=None, callsign=None) -> None:
         """新航班/新呼号时重置。"""
         with self._lock:
+            rules = (flight_plan or {}).get("flight_rules") or self._state.get("flight_rules") or "IFR"
             self._state.clear()
-            self._state.update(_new_state())
+            self._state.update(_new_state(rules))
             self.load_from_flight_plan(flight_plan or {}, callsign=callsign)
 
     def load_from_flight_plan(self, flight_plan: dict, callsign=None) -> None:
@@ -401,6 +463,12 @@ class ATCSession:
                 self._state["origin"] = origin
             if dest and dest != "N/A":
                 self._state["destination"] = dest
+            fp_rules = (fp.get("flight_rules") or "").upper()
+            if fp_rules in ("IFR", "VFR"):
+                self._state["flight_rules"] = fp_rules
+                # E12：装载 VFR 计划时若还停在 DISPATCH，直接放行到 ATIS
+                if fp_rules == "VFR" and self._state["phase"] == "DISPATCH":
+                    self._state["phase"] = "ATIS"
             try:
                 self._state["cruise_alt"] = int(fp.get("cruise_alt") or 0)
             except (TypeError, ValueError):
@@ -408,11 +476,38 @@ class ATCSession:
             if callsign:
                 self.assign("callsign", callsign, by="flight plan")
 
+    def set_flight_rules(self, rules) -> str:
+        """切换 IFR/VFR。VFR 下若还停在 DISPATCH，直接放行到 ATIS（E12 保险）。"""
+        rules = "VFR" if str(rules).upper() == "VFR" else "IFR"
+        with self._lock:
+            self._state["flight_rules"] = rules
+            if rules == "VFR" and self._state["phase"] == "DISPATCH":
+                self._state["phase"] = "ATIS"
+        return rules
+
     def mark_atis_copied(self, letter=None) -> None:
         with self._lock:
             self._state["atis_copied"] = True
             if letter:
                 self._state["atis_letter"] = str(letter).upper()
+
+    def confirm_flight_plan(self) -> None:
+        """PDC 复诵 / 数据链 WILCO：预放行确认。推进由 observe_telemetry 完成。"""
+        with self._lock:
+            self._state["fpl_confirmed"] = True
+
+    def mark_pushback_done(self) -> None:
+        with self._lock:
+            self._state["pushback_done"] = True
+
+    def mark_engines_started(self) -> None:
+        with self._lock:
+            self._state["engines_started"] = True
+
+    def set_pushback_ok(self, ok: bool) -> None:
+        """站立机位可直接滑出（无需推出）时置 True，放开 taxi 前置条件（G2）。"""
+        with self._lock:
+            self._state["pushback_ok"] = bool(ok)
 
     # ── 阶段 ────────────────────────────────────────────────────────────────
 
@@ -444,11 +539,14 @@ class ATCSession:
         - 前进：正常联络顺序；
         - 回退：说明之前跳步了（例如没放行就上塔台），允许回到前面的台补课；
         - 起飞阶段不会直接切到降落一侧的同名角色（塔台/地面各出现两次）。
+        - DISPATCH 排除在频率反查之外（E13）：PDC 走数据链，与语音调频解耦，
+          否则 tune 到 CD 频率会命中 DISPATCH 而非 CLEARANCE。
         """
         if not role_key or role_key in NON_ATC_ROLES:
             return False
         with self._lock:
-            candidates = [idx for idx, name in enumerate(PHASES) if PHASE_ROLE[name] == role_key]
+            candidates = [idx for idx, name in enumerate(PHASES)
+                          if PHASE_ROLE[name] == role_key and PHASE_ROLE[name] != "Dispatch"]
             if not candidates:
                 return False
             current = PHASES.index(self._state["phase"])
@@ -506,7 +604,11 @@ class ATCSession:
             alt = float(altitude or 0)
             gs = float(groundspeed or 0)
             target = None
-            if phase == "ATIS" and self._state["atis_copied"]:
+            if phase == "DISPATCH":
+                # E12：VFR 分流优先于 PDC 确认；IFR 必须等 fpl_confirmed
+                if self._state.get("flight_rules") == "VFR" or self._state.get("fpl_confirmed"):
+                    target = "ATIS"
+            elif phase == "ATIS" and self._state["atis_copied"]:
                 target = "CLEARANCE"
             elif phase == "GROUND_DEP" and not on_ground:
                 target = "TOWER_DEP"
@@ -687,6 +789,7 @@ class ATCSession:
                 "phase": name,
                 "label_zh": PHASE_LABEL_ZH[name],
                 "label_en": PHASE_LABEL_EN[name],
+                "label_ja": PHASE_LABEL_JA.get(name, PHASE_LABEL_EN[name]),
                 "role": role,
                 "frequency": contact["frequency"] if contact else None,
                 "state": "done" if idx < current_idx else ("current" if idx == current_idx else "next"),
@@ -760,14 +863,19 @@ class ATCSession:
                     "reason": "clearance_missing",
                 }
 
-        # 前置条件：没放行就不能进跑道/起飞
-        for field in ACTION_PREREQS.get(action, ()):
-            if not self.get(field):
+        # 前置条件：没放行就不能进跑道/起飞；没推出/非站立机位不能滑行（G2）。
+        # prereq 可以是字段名或 callable(session)->bool（返回 True 表示未满足）。
+        for prereq in ACTION_PREREQS.get(action, ()):
+            missing = prereq(self) if callable(prereq) else not self.get(prereq)
+            if missing:
+                # callable 没有字段名；taxi 的缺失项统一叫 pushback
+                reason_field = prereq if isinstance(prereq, str) else (
+                    "pushback" if action == "taxi" else action)
                 return {
                     "allowed": False,
                     "action": action,
-                    "redirect": self.contact_for("CLEARANCE"),
-                    "reason": f"missing_{field}",
+                    "redirect": self.contact_for(PREREQ_REDIRECT.get(action, "CLEARANCE")),
+                    "reason": f"missing_{reason_field}",
                 }
 
         if owner_idx > phase_idx:
@@ -846,8 +954,18 @@ class ATCSession:
                 f"NEXT CONTACT AFTER YOU: {nxt['role']} (frequency unavailable in the airport "
                 "database — say 'contact <facility>, good day' without inventing a frequency)"
             )
+        pdc_note = ""
+        with self._lock:
+            if self._state["phase"] == "DISPATCH":
+                pdc_note = (
+                    "PHASE NOTE: DISPATCH/签派 — the predeparture clearance (PDC) is delivered via "
+                    "ACARS/CPDLC data link, NOT on a voice frequency. The 121.x figure shown for "
+                    "Dispatch is the Clearance Delivery voice frequency for display only; the pilot "
+                    "submits the PDC request on the data link and reads it back to advance.\n"
+                )
         return (
             "CONTACT SEQUENCE (strict order — the pilot must never skip a station):\n"
+            f"{pdc_note}"
             f"{body}\n"
             f"{next_text}\n"
             "HANDOFF RULE: when you release this aircraft, your transmission MUST end with the handoff "
