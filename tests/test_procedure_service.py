@@ -82,6 +82,10 @@ def _build_lnm_db(path):
         fix_ident TEXT, is_missed INTEGER)""")
     cur.execute("""CREATE TABLE transition (
         transition_id INTEGER PRIMARY KEY, approach_id INTEGER, fix_ident TEXT)""")
+    # B-2：过渡段 fix 序列（transition_leg 表）
+    cur.execute("""CREATE TABLE transition_leg (
+        transition_leg_id INTEGER PRIMARY KEY, transition_id INTEGER,
+        fix_ident TEXT, is_missed INTEGER)""")
     # ZGGG：SID VIBOS2A（02L 过渡）、STAR NYB2A、ILS 20R 进近
     cur.execute("INSERT INTO approach VALUES (1,'D','VIBOS2A','ZGGG','','VIBOS','02L',1)")
     cur.execute("INSERT INTO approach VALUES (2,'A','NYB2A','ZGGG','','NYB','20R',1)")
@@ -90,10 +94,16 @@ def _build_lnm_db(path):
     cur.execute("INSERT INTO approach_leg VALUES (2,1,'AGPON',0)")
     cur.execute("INSERT INTO approach_leg VALUES (3,1,'RW02L',0)")
     cur.execute("INSERT INTO transition VALUES (1,1,'RW02L')")
+    # 02L 过渡段的 fix 序列：跑道 → 过渡点 → 交接点
+    cur.execute("INSERT INTO transition_leg VALUES (1,1,'RW02L',0)")
+    cur.execute("INSERT INTO transition_leg VALUES (2,1,'ABEDI',0)")
+    cur.execute("INSERT INTO transition_leg VALUES (3,1,'WINBI',0)")
     cur.execute("INSERT INTO approach_leg VALUES (4,2,'NYB',0)")
     cur.execute("INSERT INTO transition VALUES (2,2,'ALL')")
     cur.execute("INSERT INTO approach_leg VALUES (5,3,'IF20',0)")
     cur.execute("INSERT INTO transition VALUES (3,3,'RW20R')")
+    # 20R 进近的 RW20R 过渡段
+    cur.execute("INSERT INTO transition_leg VALUES (4,3,'CGO',0)")
     conn.commit()
     conn.close()
 
@@ -164,6 +174,26 @@ class LnmSourceTests(unittest.TestCase):
         self.assertEqual(sids[0]["runway"], "02L")
         fixes = [leg["fix"] for leg in sids[0]["legs"]]
         self.assertIn("AGPON", fixes)
+
+    def test_transition_legs_parsed_from_lnm(self):
+        # B-2：transition 表之外的 transition_leg fix 序列也要解析出来
+        sid = self.svc.get_sids("ZGGG")[0]
+        self.assertEqual(sid["transitions"], ["RW02L"])
+        self.assertEqual(
+            [t["name"] for t in sid["transition_legs"]], ["RW02L"])
+        fixes = [leg["fix"] for leg in sid["transition_legs"][0]["legs"]]
+        self.assertEqual(fixes, ["RW02L", "ABEDI", "WINBI"])
+
+    def test_all_kinds_carry_transition_legs_key(self):
+        # 结构一致性：三类源都提供 transition_legs 键（空 = 该源不拆过渡段）
+        sid = self.svc.get_sids("ZGGG")[0]
+        star = self.svc.get_stars("ZGGG")[0]
+        app = self.svc.get_approaches("ZGGG")[0]
+        self.assertIn("transition_legs", star)
+        self.assertIn("transition_legs", app)
+        self.assertIn("CGO", [leg["fix"]
+                              for t in app["transition_legs"]
+                              for leg in t["legs"]])
 
     def test_star_from_lnm(self):
         stars = self.svc.get_stars("ZGGG")

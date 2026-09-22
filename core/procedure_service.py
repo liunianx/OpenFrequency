@@ -77,12 +77,20 @@ class ProcedureService:
     # ── 对外接口 ────────────────────────────────────────────────────────────
 
     def get_sids(self, icao, runway=None) -> list:
+        """SID 列表；每条带 source 字段。
+
+        返回 **空列表** 即代表"所有本地源均无数据，调用方应交 LLM 兜底"——
+        此处刻意不返回占位 dict，避免下游把占位当真实程序（source 的取值
+        语义见 `describe_source`）。
+        """
         return self._query(icao, runway, "SID")
 
     def get_stars(self, icao, runway=None) -> list:
+        """STAR 列表；同 `get_sids`：空列表 = 交 LLM 兜底。"""
         return self._query(icao, runway, "STAR")
 
     def get_approaches(self, icao, runway=None) -> list:
+        """进近列表；同 `get_sids`：空列表 = 交 LLM 兜底。"""
         return self._query(icao, runway, "APPROACH")
 
     def get_procedures(self, icao, runway=None) -> dict:
@@ -202,7 +210,8 @@ class ProcedureService:
                 "ident": _normalize_ident(row["arinc_name"] if "arinc_name" in keys else ""),
                 "type": kind,
                 "runway": _normalize_ident(rwy) or None,
-                "transitions": transitions,
+                "transitions": [t["name"] for t in transitions],
+                "transition_legs": transitions,   # B-2：过渡段 fix 序列
                 "legs": legs,
                 "source": "lnm",
             })
@@ -234,6 +243,14 @@ class ProcedureService:
         return legs
 
     def _lnm_transitions(self, path, approach_id) -> list:
+        """过渡段完整数据：`[{'name': 过渡标识, 'legs': [{'fix': ...}]}]`。
+
+        除 transition 表（标识）外，B-2：对每个 transition_id 追加
+        transition_leg 查询（fix 序列）——与 `_lnm_legs` 同款
+        select * + row.keys() 容错。缺表/缺列时 legs 为空列表。
+        `_from_lnm` 会把它拆成 `transitions`（标识列表，prompt 消费）
+        与 `transition_legs`（完整结构）。
+        """
         try:
             conn = sqlite3.connect(path)
             conn.row_factory = sqlite3.Row
@@ -247,13 +264,45 @@ class ProcedureService:
         except Exception:
             return []
         out = []
+        seen = set()
         for row in rows:
             keys = row.keys()
             name = row["fix_ident"] if "fix_ident" in keys else None
             name = _normalize_ident(name)
-            if name and name not in out:
-                out.append(name)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            transition_id = row["transition_id"] if "transition_id" in keys else None
+            out.append({"name": name,
+                        "legs": self._lnm_transition_legs(path, transition_id)})
         return out
+
+    def _lnm_transition_legs(self, path, transition_id) -> list:
+        """B-2：单个过渡段的 fix 序列（transition_leg 表，容错读取）。"""
+        if not transition_id:
+            return []
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM transition_leg WHERE transition_id = ? "
+                    "ORDER BY transition_leg_id", (transition_id,))
+                rows = cursor.fetchall()
+            finally:
+                conn.close()
+        except Exception:
+            return []
+        legs = []
+        for row in rows:
+            keys = row.keys()
+            if "fix_ident" in keys and row["fix_ident"]:
+                leg = {"fix": _normalize_ident(row["fix_ident"])}
+                if "is_missed" in keys:
+                    leg["missed"] = bool(row["is_missed"])
+                legs.append(leg)
+        return legs
 
     # ── 源 2：X-Plane earth_424.dat（ARINC 424-18，仅美国） ──────────────────
 
@@ -333,6 +382,7 @@ class ProcedureService:
                 "type": kind,
                 "runway": next((v for v in proc["runways"] if v), None),
                 "transitions": sorted(t for t in proc["transitions"] if t != "ALL"),
+                "transition_legs": [],   # CIFP 的 legs 已含过渡段，无需另列
                 "legs": legs,
                 "source": "cifp",
             })
@@ -360,7 +410,8 @@ class ProcedureService:
         if runway and plan_rwy and plan_rwy not in _runway_variants(runway):
             return []
         return [{"ident": ident, "type": kind, "runway": plan_rwy or None,
-                 "transitions": [], "legs": [], "source": "simbrief"}]
+                 "transitions": [], "transition_legs": [],
+                 "legs": [], "source": "simbrief"}]
 
     def set_simbrief_plan(self, plan: dict | None):
         """注入 SimBrief 归一化后的飞行计划（origin/destination/sid/star/dep_rwy/arr_rwy）。"""
