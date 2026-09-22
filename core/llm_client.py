@@ -390,6 +390,26 @@ class LLMClient:
         # ── B1: 真实程序块（SID/STAR/进近，带 source）──────────────────────
         # 有真实程序则逐字使用，否则可生成；source=llm 表示无任何本地数据。
         procedures_text = self._build_procedures_block(context_copy)
+
+        # ── D2: 离场队列块（仅 TOWER_DEP 阶段注入） ─────────────────────────
+        departure_queue_text = ""
+        if session.phase == "TOWER_DEP":
+            queue_snap = context_copy.get('atc_state', {}).get('departure_queue') or {}
+            ahead = queue_snap.get('queue') or []
+            if ahead:
+                listed = "; ".join(
+                    f"#{item['position']} {item['callsign']} ({item['state']}"
+                    + (f", {item['wake_category']}" if item.get('wake_category') else "")
+                    + ")"
+                    for item in ahead[:8])
+                est = " (wait times are ICAO-based estimates)" if queue_snap.get('estimated') else ""
+                departure_queue_text = (
+                    "DEPARTURE QUEUE for this runway (AI traffic ahead of you — you are at the END of "
+                    "this list unless your own callsign appears):\n"
+                    f"    {listed}\n"
+                    "If the pilot requests takeoff and aircraft are ahead, tell them their queue "
+                    "position and to hold short — do NOT clear an immediate takeoff." + est
+                )
         
         # Weather
         metar = context_copy['environment'].get('metar', 'N/A')
@@ -700,6 +720,8 @@ class LLMClient:
         {fp_text}
 
         {procedures_text}
+
+        {departure_queue_text}
 
         {freq_text}
 

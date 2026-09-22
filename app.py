@@ -1880,6 +1880,9 @@ if __name__ == '__main__':
     tts_engine = TTSEngine(config, socketio)
     atis_generator = ATISGenerator(config, socketio, airport_frequency_service=airport_frequency_service)
     traffic_manager = TrafficStateManager(config, sim_bridge, socketio)
+    # D1/D2 + A3：排队器与停机位占用检查需要真实交通表
+    logic_manager._traffic_manager = traffic_manager
+    logic_manager.departure_sequencer.traffic_manager = traffic_manager
     chatter_generator = ChatterGenerator(config, tts_engine)
     black_box = BlackBox(config)
     flight_analyzer = FlightAnalyzer(config, socketio)

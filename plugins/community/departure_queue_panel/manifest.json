@@ -1,0 +1,12 @@
+{
+  "id": "departure_queue_panel",
+  "name": "Departure Queue Panel",
+  "version": "1.0.0",
+  "author": "OpenFrequency",
+  "description": "展示塔台离场排队与最近 ATC 动作（验证 on_atc_action / on_traffic_update 钩子链）",
+  "entry": "plugin.py",
+  "hooks": [
+    "on_atc_action",
+    "on_traffic_update"
+  ]
+}

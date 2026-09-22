@@ -14,6 +14,7 @@ from .china_airspace import is_in_china_airspace, nearest_metric_rvsm_level, met
 from .atc_template_responder import ATCTemplateResponder
 from .gate_assigner import assign_gate, compute_occupied_stands
 from .procedure_service import _normalize_ident, _ident_prefix_match
+from .departure_sequencer import DepartureSequencer
 
 class LogicManager:
     """
@@ -33,6 +34,9 @@ class LogicManager:
         self.atc_session.attach(shared_context)
         self.taxi_router = TaxiRouter(ground_service) if ground_service else None
         self.template_responder = ATCTemplateResponder(airport_frequency_service)
+        # D1：离场排队（模拟器无关；traffic_manager 由 app.py 启动后注入）
+        self.departure_sequencer = DepartureSequencer(
+            config, traffic_manager=None, taxi_router=self.taxi_router)
         self.workload_sim = WorkloadSimulator(config)
         self.scheduler = None
         self.last_freq = 0.0
@@ -115,6 +119,8 @@ class LogicManager:
         event_bus.on('config_updated', self._handle_config_updated)
         # Auto-busy: keep workload_sim in sync with nearby traffic count
         event_bus.on('traffic_update', self._on_traffic_update)
+        # D2: 交通状态变化驱动离场队列重算（traffic_manager.py 已 emit）
+        event_bus.on('traffic_state_change', self._on_traffic_state_change)
         
         # Start Infinite Pattern Loop if enabled
         if self.infinite_pattern and self.scheduler:
@@ -324,6 +330,37 @@ class LogicManager:
                 'level': self.workload_sim.effective_busy_level,
                 'auto': self.workload_sim.auto_busy,
             })
+
+    def _own_position(self):
+        with context_lock:
+            ac = shared_context.get('aircraft', {}) or {}
+        return {'lat': ac.get('latitude'), 'lon': ac.get('longitude')}
+
+    def _refresh_departure_queue(self):
+        """D1/D2：重算当前跑道的起飞队列并写入 shared_context（供 prompt 与 UI）。"""
+        runway = self.atc_session.get('runway')
+        try:
+            self.departure_sequencer.rebuild(own_runway=runway, own_position=self._own_position())
+        except Exception as e:
+            print(f"LogicManager: departure queue rebuild failed: {e}")
+            return None
+        snapshot = self.departure_sequencer.queue_snapshot(runway) if runway else None
+        with context_lock:
+            if snapshot:
+                shared_context['atc_state']['departure_queue'] = snapshot
+            else:
+                shared_context['atc_state'].pop('departure_queue', None)
+        if snapshot and self.socketio:
+            try:
+                self.socketio.emit('departure_queue_update', snapshot)
+            except Exception:
+                pass
+        return snapshot
+
+    def _on_traffic_state_change(self, event_data):
+        """AI 飞机状态变化（traffic_state_change）→ 队列重算。"""
+        if self.atc_session.phase in ('TOWER_DEP', 'GROUND_DEP'):
+            self._refresh_departure_queue()
 
     def on_flight_plan_loaded(self, flight_plan):
         self._sync_flight_rules()
@@ -1084,6 +1121,8 @@ class LogicManager:
     def _on_phase_advanced(self, phase, current_controller):
         """阶段前进一步时，让当前管制员主动发出带频率的移交指令。"""
         self._sync_procedures()
+        if phase == 'TOWER_DEP':
+            self._refresh_departure_queue()
         contact = self.atc_session.contact_for(phase)
         if not contact or not contact.get('frequency'):
             return
@@ -1208,6 +1247,11 @@ class LogicManager:
                 else:
                     reply = f"{prefix}请先联系{role_zh}，再见。"
                 print(f"LogicManager: [Tier 0] 越权请求 '{check['action']}'({check['reason']}) → {reply}")
+                # D2：激活插件钩子链（plugin_manager 已订阅 atc_action）
+                event_bus.emit('atc_action', 'contact', {
+                    'action': check['action'], 'reason': check['reason'],
+                    'role': redirect.get('role'), 'frequency': freq,
+                })
                 self.on_llm_response(reply, None)
                 return
 
@@ -1253,6 +1297,25 @@ class LogicManager:
 
         if check['action'] == 'gate_request':
             self._assign_gate(tuned_role, ctx_snapshot)
+
+        # ── D2: Tier-0 起飞排队插点（跑道/应答机 prereq 通过之后） ────────────
+        # 插在 prereq 之后，避免与 missing_runway 重定向冲突。
+        if check['allowed'] and check['action'] == 'takeoff' \
+                and tuned_role == 'Tower' and self.atc_session.phase == 'TOWER_DEP':
+            self._refresh_departure_queue()
+            callsign = self._resolve_callsign(ctx_snapshot)
+            runway = self.atc_session.get('runway')
+            slot = self.departure_sequencer.request_takeoff_slot(callsign, runway or '')
+            if slot['position'] > 1:
+                prefix = f"{callsign}，" if callsign else ""
+                reply = (f"{prefix}排在第 {slot['position']} 位，"
+                         f"跟在前机 {slot['leader']} 之后，预计等待 {slot['wait_seconds']} 秒。")
+                print(f"LogicManager: [Tier 0] 起飞排队 → {reply}")
+                event_bus.emit('atc_action', 'departure_queue', slot)
+                self.on_llm_response(reply, None)
+                return
+            # 队列为空：直接放行，空队列快照留给后续 prompt
+            event_bus.emit('atc_action', 'cleared_takeoff', {'runway': runway})
 
         # ── Tier 1: Keyword / template auto-match ───────────────────────────
         # Pure readbacks / roger / wilco → instant canned response, no AI.
@@ -1447,6 +1510,10 @@ class LogicManager:
         # 权威状态必须先落库：即使没识别出任何卡片，也要从原文里抓跑道/应答机/SID，
         # 否则后一个管制员就看不到前面指定的值。
         self._update_issued_instructions(cards, text, sender=sender)
+        # D2：由卡片 + 原文派生 atc_action 并 emit，激活插件钩子链
+        # （plugin_manager.py:79 已订阅 but 此前从未被触发，见 G4）。
+        for action, params in self._derive_atc_actions(cards, text).items():
+            event_bus.emit('atc_action', action, params)
         if not cards:
             return
         self.socketio.emit('instruction_cards_update', {
@@ -1458,6 +1525,41 @@ class LogicManager:
         # ── Radar vector mode: apply AP commands to simulator ─────────────
         if self.radar_vector_mode and self._sim_bridge:
             self._apply_radar_vectors(cards)
+
+    # 卡片类型 → atc_action 名（D2）
+    _CARD_TO_ACTION = {
+        'SQ': 'squawk',
+        'ALT': 'altitude_change',
+        'HDG': 'fly_heading',
+        'SPD': 'speed_change',
+        'QNH': 'altimeter_set',
+        'ALTIM': 'altimeter_set',
+        'APP': 'approach_clearance',
+        'TAXI': 'taxi',
+        'FREQ': 'contact',
+    }
+
+    # 终止性许可关键语 → atc_action（卡片识别不到语义时兜底）
+    _TEXT_ACTION_MARKS = [
+        ('cleared_takeoff', re.compile(r'cleared for takeoff|可以起飞|允许起飞|准许起飞', re.I)),
+        ('cleared_land', re.compile(r'cleared to land|可以落地|可以着陆|允许落地', re.I)),
+        ('lineup_wait', re.compile(r'line ?up|进[入]?跑道等待|对准跑道', re.I)),
+        ('go_around', re.compile(r'go around|复飞', re.I)),
+        ('pushback_approved', re.compile(r'pushback approved|允许推出|同意推出', re.I)),
+    ]
+
+    @classmethod
+    def _derive_atc_actions(cls, cards, text) -> dict:
+        """由 InstructionExtractor 卡片 + 原文派生结构化动作（G4/D2）。"""
+        actions = {}
+        for card in cards or []:
+            action = cls._CARD_TO_ACTION.get(card['type'])
+            if action:
+                actions[action] = {'value': card.get('value'), 'type': card['type']}
+        for action, pattern in cls._TEXT_ACTION_MARKS:
+            if pattern.search(text or ''):
+                actions[action] = {'source': 'text'}
+        return actions
 
     def _apply_radar_vectors(self, cards: list):
         """Push heading / altitude / speed cards to the simulator autopilot."""
