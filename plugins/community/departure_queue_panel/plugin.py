@@ -9,6 +9,21 @@
 from core.plugin_api import OpenFrequencyPlugin
 
 
+def _owned_badge(traffic_item) -> str:
+    """自有 AI 的"可指挥"角标（混合自有交通 P4，见 §4 P4）。
+
+    traffic_update 的 owned/owned_id 字段由 traffic_manager P2 回灌
+    （owned=True 标记注入器自建机）。FSLTL 只读机无此标记，不渲染角标。
+    """
+    if not isinstance(traffic_item, dict) or not traffic_item.get('owned'):
+        return ""
+    owned_id = traffic_item.get('owned_id') or ''
+    title = f" title='自有 AI（{owned_id}）· 可指挥'" if owned_id else \
+            " title='自有 AI · 可指挥'"
+    return (" <span class='badge bg-info text-dark'"
+            f"{title}>🎯可指挥</span>")
+
+
 class Plugin(OpenFrequencyPlugin):
 
     PANEL_ID = "departure_queue"
@@ -44,15 +59,21 @@ class Plugin(OpenFrequencyPlugin):
     def on_traffic_update(self, icao: str, traffic: list):
         """交通表每次批量更新时刷新面板。"""
         count = len(traffic) if isinstance(traffic, list) else 0
+        owned_count = sum(1 for t in (traffic or [])
+                          if isinstance(t, dict) and t.get('owned'))
         self._queue_count = count
         rows = "".join(
             f"<li>{t.get('callsign', '?')} — {t.get('state', '?')}"
-            f"{' / ' + t['rwy'] if t.get('rwy') else ''}</li>"
+            f"{' / ' + t['rwy'] if t.get('rwy') else ''}"
+            f"{_owned_badge(t)}</li>"
             for t in (traffic or [])[:8]
         ) or "<li>（无 AI 交通）</li>"
+        owned_hint = (f" · 🎯可指挥 {owned_count} 架"
+                      if owned_count else "")
         self.inject_panel(
             self.PANEL_ID,
-            html=(f"<div class='small'>机场 {icao or '—'} · 目标 {count} 架</div>"
+            html=(f"<div class='small'>机场 {icao or '—'} · 目标 {count} 架"
+                  f"{owned_hint}</div>"
                   f"<ul class='small mb-0'>{rows}</ul>"),
             position="sidebar",
             title="离场排队",

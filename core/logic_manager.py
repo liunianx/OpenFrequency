@@ -41,6 +41,10 @@ class LogicManager:
         # 完全回到升级前行为（§12 回滚策略）
         self._sequencer_enabled = bool(
             (config.get('traffic', {}) or {}).get('sequencer_enabled', False))
+        # 混合自有交通 P3 自动策略（纯决策；无注入器时所有动作为空）。
+        # owned.enabled 与 sequencer_enabled 相互独立（§5 回退开关约定）。
+        from .owned_traffic_policy import OwnedTrafficPolicy
+        self.owned_traffic_policy = OwnedTrafficPolicy(config)
         self.workload_sim = WorkloadSimulator(config)
         self.scheduler = None
         self.last_freq = 0.0
@@ -341,6 +345,44 @@ class LogicManager:
         with context_lock:
             ac = shared_context.get('aircraft', {}) or {}
         return {'lat': ac.get('latitude'), 'lon': ac.get('longitude')}
+
+    def _owned_traffic_policy_tick(self, player_position=1):
+        """混合自有交通 P3 自动策略（见 core/owned_traffic_policy.py）。
+
+        玩家请求起飞时调用：
+          1) 早生成：活跃自有 AI < max 且已知机场 → spawn（ParkedATC，
+             不带计划=原地等；release 后还需 ~90-120s 排班才动，所以要早）；
+          2) FIFO 放行：冷却满足且最年长的未放行机 → emit
+             owned_traffic_cleared（controller 赋予飞行计划）。
+        spawn 的调用方是策略模块，战术动作都是日志化的，失败不影响 ATC 主链。
+        """
+        injector = getattr(self, '_owned_injector', None)
+        if injector is None or not getattr(injector, 'available', False):
+            return
+        try:
+            with context_lock:
+                airport = (shared_context.get('environment', {}) or {}).get(
+                    'current_airport')
+            taken = (list(self._traffic_manager.aircraft.keys())
+                     if getattr(self, '_traffic_manager', None) else [])
+            actions = self.owned_traffic_policy.on_takeoff_request(
+                injector.list_owned(), airport, player_position, taken)
+            for kind, payload in actions:
+                if kind == 'spawn':
+                    owned_id = injector.spawn(payload)
+                    if owned_id:
+                        print(f"LogicManager: owned traffic spawned {owned_id} "
+                              f"({payload.get('callsign')} @ "
+                              f"{payload.get('airport')})")
+                elif kind == 'release':
+                    event_bus.emit('owned_traffic_cleared', {
+                        'owned_id': payload,
+                        'runway': self.atc_session.get('runway') or '',
+                        'flight_plan': self.owned_traffic_policy.flight_plan,
+                    })
+                    self.owned_traffic_policy.note_released()
+        except Exception as e:  # noqa: BLE001 — 策略失败绝不拖垮 ATC 主链
+            print(f"LogicManager: owned traffic policy tick failed — {e!r}")
 
     def _refresh_departure_queue(self):
         """D1/D2：重算当前跑道的起飞队列并写入 shared_context（供 prompt 与 UI）。"""
@@ -1310,6 +1352,12 @@ class LogicManager:
 
         if check['action'] == 'gate_request':
             self._assign_gate(tuned_role, ctx_snapshot)
+
+        # ── 混合自有交通 P3 自动策略（早生成 + FIFO 放行）────────────────────
+        # 独立于 sequencer 开关：owned.enabled 开即有注入器；无注入器时无操作。
+        if check['allowed'] and check['action'] == 'takeoff' \
+                and tuned_role == 'Tower' and self.atc_session.phase == 'TOWER_DEP':
+            self._owned_traffic_policy_tick()
 
         # ── D2: Tier-0 起飞排队插点（跑道/应答机 prereq 通过之后） ────────────
         # 插在 prereq 之后，避免与 missing_runway 重定向冲突。

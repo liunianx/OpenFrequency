@@ -1,6 +1,16 @@
 import multiprocessing
 multiprocessing.freeze_support()  # Must be called early for PyInstaller + Windows spawn
 
+import sys
+# On a non-UTF-8 console (e.g. Windows GBK/cp936), printing emoji or CJK text
+# raises UnicodeEncodeError and crashes startup. Force stdout/stderr to UTF-8 and
+# never let an un-encodable character abort the process.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import os
 import markdown
@@ -558,6 +568,68 @@ def request_taxi_route():
         return jsonify({"status": "error", "message": "Logic manager not ready"}), 503
     logic_manager._refresh_ground_context()
     return jsonify({"status": "ok"})
+
+# ── 混合自有交通（owned-traffic P3）手动验证入口 ────────────────────────────
+# 自动的"排队→放行"策略由 sequencer 接线提供（P3 后续增量）；这两个路由
+# 用于在真实 MSFS 上手动验证 P3-A 闭环：
+#   spawn：ParkedATC 创建（不带计划=原地等）
+#   clear：赋予飞行计划 → 内建 AI-ATC ~90-120s 后自主滑行起飞
+@app.route('/api/owned_traffic/spawn', methods=['POST'])
+def owned_traffic_spawn():
+    injector = getattr(logic_manager, '_owned_injector', None) \
+        if logic_manager else None
+    if injector is None:
+        return jsonify({"status": "error",
+                        "message": "owned traffic not enabled"}), 503
+    data = request.get_json(silent=True) or {}
+    owned_cfg = (config.get('traffic', {}) or {}).get('owned', {}) or {}
+    spec = {
+        "callsign": data.get("callsign") or "OF001",
+        "tail_number": data.get("tail_number"),
+        # 未显式给 title 时用配置的 default_model_title（MSFS2024 上必须填，
+        # 见 docs/hybrid-owned-traffic-plan.md §9 P0-7/8）
+        "model_title": data.get("model_title")
+                       or owned_cfg.get("default_model_title") or None,
+        "airport": data.get("airport"),      # 带 ICAO → ParkedATC（A 路径）
+        "latitude": data.get("latitude"),    # 不带 airport → NonATC 按坐标
+        "longitude": data.get("longitude"),
+        "altitude_ft": data.get("altitude_ft"),
+        "heading": data.get("heading"),
+    }
+    owned_id = injector.spawn(spec)
+    if owned_id is None:
+        return jsonify({"status": "error",
+                        "message": injector.last_error or "spawn failed"}), 500
+    return jsonify({"status": "ok", "owned_id": owned_id,
+                    "record": injector.get_owned(owned_id)})
+
+
+@app.route('/api/owned_traffic/clear', methods=['POST'])
+def owned_traffic_clear():
+    data = request.get_json(silent=True) or {}
+    owned_id = data.get("owned_id")
+    flight_plan = data.get("flight_plan")
+    if not owned_id or not flight_plan:
+        return jsonify({"status": "error",
+                        "message": "owned_id and flight_plan required"}), 400
+    # 经事件总线放行——与 sequencer 未来的自动放行同一入口（控制器监听）
+    event_bus.emit('owned_traffic_cleared', {
+        "owned_id": owned_id,
+        "runway": data.get("runway") or '',
+        "flight_plan": flight_plan,
+    })
+    return jsonify({"status": "ok", "owned_id": owned_id})
+
+
+@app.route('/api/owned_traffic')
+def owned_traffic_list():
+    injector = getattr(logic_manager, '_owned_injector', None) \
+        if logic_manager else None
+    if injector is None:
+        return jsonify({"status": "error",
+                        "message": "owned traffic not enabled"}), 503
+    return jsonify({"status": "ok", "owned": injector.list_owned(),
+                    "object_index": injector.owned_object_index()})
 
 @app.route('/api/xplane/traffic_targets')
 def get_xplane_traffic_targets():
@@ -1921,6 +1993,56 @@ if __name__ == '__main__':
     # D1/D2 + A3：排队器与停机位占用检查需要真实交通表
     logic_manager._traffic_manager = traffic_manager
     logic_manager.departure_sequencer.traffic_manager = traffic_manager
+    # 混合自有交通（docs/hybrid-owned-traffic-plan.md P1/P2）：
+    # 默认关闭（traffic.owned.enabled=false）；开启且非 X-Plane 时创建
+    # 自有 AI 注入器并挂到交通表。启动失败一律降级，不影响 FSLTL 只读通道。
+    try:
+        _owned_cfg = (config.get('traffic', {}) or {}).get('owned', {}) or {}
+        if _owned_cfg.get('enabled', False) and \
+                sim_bridge.provider_type in ('msfs', 'p3d', 'fsx'):
+            from core.owned_traffic_injector import OwnedTrafficInjector
+            owned_injector = OwnedTrafficInjector(
+                config,
+                dedup_provider=lambda: list(traffic_manager.aircraft.keys()))
+            if owned_injector.start():
+                traffic_manager.set_owned_traffic(owned_injector)
+                logic_manager._owned_injector = owned_injector
+                # P3-A：放行门控 + 离场回收控制器（监听 owned_traffic_cleared）
+                from core.owned_traffic_controller import OwnedTrafficController
+                owned_controller = OwnedTrafficController(config,
+                                                          owned_injector)
+                if owned_controller.start():
+                    logic_manager._owned_controller = owned_controller
+            else:
+                print(f"OwnedTrafficInjector: unavailable — "
+                      f"{owned_injector.last_error}; owned traffic disabled")
+    except Exception as e:
+        print(f"OwnedTrafficInjector: init skipped — {e!r}")
+    # P4：进程退出时清理自有 AI，避免孤儿 SimObject（计划 §8 风险表）。
+    # 顺序：先停 controller（tick 不再触发动作）→ 停 traffic_manager
+    # （其 stop() 内部停注入器，注入器先 despawn_all 再关句柄）。
+    # 注：atexit 不覆盖 taskkill/断电——那种情况靠 sim 退出自毁对象。
+    import atexit
+
+    def _shutdown_owned_traffic():
+        controller = getattr(logic_manager, '_owned_controller', None)
+        if controller is not None:
+            try:
+                controller.stop()
+            except Exception:
+                pass
+        if traffic_manager is not None:
+            try:
+                traffic_manager.stop()
+            except Exception:
+                pass
+        injector = getattr(logic_manager, '_owned_injector', None)
+        if injector is not None:
+            try:
+                injector.stop()   # 内部先 despawn_all（幂等）
+            except Exception:
+                pass
+    atexit.register(_shutdown_owned_traffic)
     chatter_generator = ChatterGenerator(config, tts_engine)
     black_box = BlackBox(config)
     flight_analyzer = FlightAnalyzer(config, socketio)

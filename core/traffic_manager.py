@@ -59,6 +59,12 @@ class AircraftTrackingData:
     icao_dest: Optional[str] = None         # AI_TRAFFIC_TOAIRPORT
     eta_s: Optional[float] = None           # AI_TRAFFIC_ETA（秒）
 
+    # 混合自有交通（owned-traffic，docs/hybrid-owned-traffic-plan.md P2）：
+    # 本项目自建的自有 AI（owner=OpenFrequency，可写）与 FSLTL 只读机同表，
+    # 用 owned=True 区分——sequencer / chatter 无需改判定逻辑即可纳入。
+    owned: bool = False                # 是否 OwnedTrafficInjector 自建
+    owned_id: Optional[str] = None     # 注入器侧的 owned_id（如 "owned-1"）
+
 class TrafficStateManager:
     """
     Manages tracking and state detection for AI traffic.
@@ -92,6 +98,9 @@ class TrafficStateManager:
         self.msfs_ai_enabled = bool(config.get('traffic', {}).get('msfs_ai_enabled', True))
         self._traffic_reader = None
         self._reader_failed = False
+        # 混合自有交通（owned-traffic P2）：注入器由 app.py 在
+        # traffic.owned.enabled=true 时挂接；未挂接/关闭时全部路径行为不变。
+        self._owned_injector = None
 
         print("TrafficStateManager: Initialized.")
 
@@ -102,6 +111,40 @@ class TrafficStateManager:
         if reader is None or not getattr(reader, 'available', False):
             return 'unavailable'
         return getattr(reader, 'source_state', 'unavailable')
+
+    # ── 混合自有交通（owned-traffic，docs/hybrid-owned-traffic-plan.md P2）──
+
+    def set_owned_traffic(self, injector):
+        """挂接 OwnedTrafficInjector（app.py 在 traffic.owned.enabled=true
+        且 SimConnect 族 provider 时调用）。挂接后，枚举到的 SimObject 若
+        命中注入器的 object_id 索引，即标注 owned=True——自有 AI 与 FSLTL
+        只读机进同一张 aircraft 表，sequencer / chatter 无差别纳入。"""
+        self._owned_injector = injector
+        print("TrafficStateManager: owned traffic injector attached")
+
+    @property
+    def owned_traffic(self):
+        return self._owned_injector
+
+    def _owned_mark_for(self, object_id):
+        """object_id → {'owned': True, 'owned_id': ...}；非自有返回 None。
+
+        注入器不可用/未挂接时返回 None（纯 FSLTL 行为不变）。
+        [需实机验证] MSFS 枚举出的 ATC ID/机型是否与 spawn spec 一致——
+        影响 owned 标记能否命中（计划 §9 P0）。
+        """
+        injector = self._owned_injector
+        if injector is None or object_id is None:
+            return None
+        try:
+            index = injector.owned_object_index()
+            owned_id = index.get(object_id)
+        except Exception as e:
+            print(f"TrafficStateManager: owned index lookup failed — {e!r}")
+            return None
+        if not owned_id:
+            return None
+        return {'owned': True, 'owned_id': owned_id}
 
     def _ensure_traffic_reader(self):
         """惰性创建 AI 交通读取器。失败只记录一次并保持 None（降级 mock）。"""
@@ -138,6 +181,12 @@ class TrafficStateManager:
                 reader.stop()
             except Exception as e:
                 print(f"TrafficStateManager: reader stop error: {e}")
+        injector = self._owned_injector
+        if injector is not None:
+            try:
+                injector.stop()   # 内部先 despawn_all，避免孤儿 SimObject
+            except Exception as e:
+                print(f"TrafficStateManager: owned injector stop error: {e}")
     
     def _loop(self):
         """Main scanning loop."""
@@ -373,10 +422,18 @@ class TrafficStateManager:
         # _cleanup_stale() will remove them after STALE_TIMEOUT seconds
 
     def _process_ai_object(self, ai_data):
-        """处理单个 AI 对象（C1 的结构化 dict：callsign/位置/机型/尾流/分配跑道等）。"""
+        """处理单个 AI 对象（C1 的结构化 dict：callsign/位置/机型/尾流/分配跑道等）。
+
+        混合自有交通（P2）：若 object_id 命中 OwnedTrafficInjector 索引，
+        打 owned=True + owned_id——与 FSLTL 只读机同表、同字段形态。
+        """
         callsign = ai_data.get('callsign', ai_data.get('atc_id', 'UNKNOWN'))
         if not callsign or callsign == 'UNKNOWN':
             return
+
+        owned_mark = self._owned_mark_for(ai_data.get('object_id'))
+        if owned_mark:
+            ai_data = {**ai_data, **owned_mark}
 
         # Update traffic data
         self.update_aircraft(callsign, {
@@ -393,6 +450,10 @@ class TrafficStateManager:
             'assigned_parking': ai_data.get('assigned_parking'),
             'icao_dest': ai_data.get('icao_dest'),
             'eta_s': ai_data.get('eta_s'),
+            # 混合自有交通（P2）：命中注入器索引时为 True/owned_id，
+            # FSLTL 只读机保持默认 False（两个键不在 ai_data 里即普通机）
+            'owned': bool(ai_data.get('owned', False)),
+            'owned_id': ai_data.get('owned_id'),
         })
     
     def _generate_enhanced_mock_traffic(self):
@@ -441,6 +502,9 @@ class TrafficStateManager:
                     'rwy': ac.assigned_runway,
                     'stand': ac.assigned_parking,
                     'dest': ac.icao_dest,
+                    # 混合自有交通（P2）：UI/队列面板据此加"可指挥"角标（P4）
+                    'owned': ac.owned,
+                    'owned_id': ac.owned_id,
                 })
 
             if traffic_list:
@@ -511,6 +575,12 @@ class TrafficStateManager:
                               ('eta_s', 'eta_s')):
                 if key in data and data[key] not in (None, ''):
                     setattr(ac, attr, data[key])
+            # 混合自有交通（P2）：owned 只升不降——despawn 后条目由
+            # _cleanup_stale 整行移除，不依赖重置标记
+            if data.get('owned'):
+                ac.owned = True
+                if data.get('owned_id'):
+                    ac.owned_id = data.get('owned_id')
             
             # Check for teleport
             if self._check_teleport(ac):

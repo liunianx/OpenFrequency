@@ -45,7 +45,16 @@
         "traffic_radius_nm": 40,
         "sequencer_enabled": false,
         "chatter_enabled": true,
-        "wake_sep_seconds": null
+        "wake_sep_seconds": null,
+        "owned": {
+            "enabled": false,
+            "max_aircraft": 2,
+            "drive_mode": "ai_atc",
+            "default_model_title": "",
+            "despawn_on_airborne_nm": 5,
+            "flight_plan": "",
+            "release_interval_s": 180
+        }
     },
     "immersion": {
         "busy_level": "medium",
